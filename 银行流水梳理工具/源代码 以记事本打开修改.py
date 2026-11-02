@@ -2093,12 +2093,9 @@ class App:
         manual_cb.pack(anchor="w")
 
         self.manual_row = Frame(self.manual_frame, bg="#f0f0f0")
-        self.manual_btn = Button(self.manual_row, text="选择列（金额 / 对手方名称 / 对手方ID）…",
-                                 font=("微软雅黑", 9), bg="#e0e0e0", command=self.pick_manual_all)
         self.manual_pick = Label(self.manual_row, text="", bg="#f0f0f0", font=("微软雅黑", 9),
                                  fg="#006400", wraplength=620, justify="left")
-        self.manual_btn.pack(side="left")
-        self.manual_pick.pack(side="left", padx=8)
+        self.manual_pick.pack(anchor="w")
         self.manual_row.pack_forget()
 
         row += 1
@@ -2234,16 +2231,35 @@ class App:
             except Exception:
                 pass
         return titles
-    def _pick_titles(self, titles, initial=None, title="选择列", hint="单击一行即可勾选/取消（可多选）："):
-        """通用勾选窗口：一行一个勾选框，单击切换，返回选中列表；取消返回 None。"""
+    def _split_var(self, var):
+        return [p.strip() for p in re.split(r"[，,、]+", var.get()) if p.strip()]
+
+    def _pick_columns(self, titles, need, cur):
+        """统一勾选窗口：每个表头一行，列为 金额 / 名称 / ID / 脱敏（按 need 显示）。
+
+        need: 可含 "amount" / "cp" / "id" / "des" 的子集；cur: 同键→已选列表。
+        单击勾选；滚轮可滚动；确定返回 dict，取消返回 None。
+        """
         if not titles:
             messagebox.showwarning("列不出表头", "这份文件里没识别到表头行，无法列出可选的列。")
             return None
+        cols = []
+        if "amount" in need:
+            cols.append(("amount", "金额"))
+        if "cp" in need:
+            cols.append(("cp", "名称"))
+        if "id" in need:
+            cols.append(("id", "ID"))
+        if "des" in need:
+            cols.append(("des", "脱敏"))
         win = tk.Toplevel(self.root)
-        win.title(title)
-        win.geometry("440x520")
+        win.title("选择列（" + " / ".join(c[1] for c in cols) + "）")
+        win.geometry("600x560")
         win.transient(self.root)
-        tk.Label(win, text=hint, font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=(10, 4))
+        tk.Label(win, text="每个表头一行；勾上它属于哪种列（可同时勾多种）：",
+                 font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=(10, 0))
+        tk.Label(win, text="金额=交易金额列，名称=对手方名称列，ID=对手方账户ID列，脱敏=该列做脱敏；取消=本次不处理。",
+                 font=("微软雅黑", 9), fg="#666666", wraplength=560, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
         holder = tk.Frame(win)
         holder.pack(fill="both", expand=True, padx=10)
         canvas = tk.Canvas(holder, borderwidth=0, highlightthickness=0, bg="white")
@@ -2254,81 +2270,18 @@ class App:
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        def _on_wheel(event, _c=canvas):
-            try:
-                _c.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            except Exception:
-                pass
-        win.bind("<MouseWheel>", _on_wheel)
-        init = set(initial or [])
-        vars_ = {}
-        for t in titles:
-            v = tk.BooleanVar(value=(t in init))
-            tk.Checkbutton(inner, text=t, variable=v, bg="white", anchor="w",
-                           font=("微软雅黑", 9), justify="left",
-                           activebackground="white").pack(fill="x", anchor="w")
-            vars_[t] = v
-        result = {"ok": False}
-
-        def _ok():
-            result["ok"] = True
-            win.destroy()
-
-        btns = tk.Frame(win)
-        btns.pack(pady=8)
-        tk.Button(btns, text="确定", width=10, command=_ok).pack(side=tk.LEFT, padx=6)
-        tk.Button(btns, text="取消", width=10, command=win.destroy).pack(side=tk.LEFT, padx=6)
-        self.root.wait_window(win)
-        if not result["ok"]:
-            return None
-        return [t for t in titles if vars_[t].get()]
-
-    def _ask_reference_file(self):
-        return filedialog.askopenfilename(
-            title="先选一份要处理的流水文件（用它列出可选列）",
-            filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")])
-
-    def _pick_roles(self, titles, cur_amount=(), cur_cp=(), cur_id=()):
-        """一个窗口里同时勾：哪个表头是金额列 / 对手方名称列 / 对手方ID列。取消返回 None。"""
-        if not titles:
-            messagebox.showwarning("列不出表头", "这份文件里没识别到表头行，无法列出可选的列。")
-            return None
-        a_set, c_set, i_set = set(cur_amount), set(cur_cp), set(cur_id)
-        win = tk.Toplevel(self.root)
-        win.title("选择列（金额 / 对手方名称 / 对手方ID）")
-        win.geometry("560x560")
-        win.transient(self.root)
-        tk.Label(win, text="每个表头一行，直接勾选它属于哪种列（可同时勾多种）：",
-                 font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=(10, 2))
-        tk.Label(win, text="提示：勾「金额」= 交易金额列；勾「名称」= 对手方名称列；勾「ID」= 对手方账户ID列。",
-                 font=("微软雅黑", 9), fg="#666666").pack(anchor="w", padx=10, pady=(0, 6))
-        holder = tk.Frame(win)
-        holder.pack(fill="both", expand=True, padx=10)
-        canvas = tk.Canvas(holder, borderwidth=0, highlightthickness=0, bg="white")
-        sb = tk.Scrollbar(holder, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg="white")
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        def _on_wheel(event, _c=canvas):
-            try:
-                _c.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            except Exception:
-                pass
-        win.bind("<MouseWheel>", _on_wheel)
-        for c, txt in ((0, "表头"), (1, "金额"), (2, "名称"), (3, "ID")):
-            tk.Label(inner, text=txt, bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=c, sticky="w", padx=6, pady=2)
+        tk.Label(inner, text="表头", bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        for i, (key, label) in enumerate(cols, start=1):
+            tk.Label(inner, text=label, bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=i, padx=8)
         state = {}
         for r, t in enumerate(titles, start=1):
             tk.Label(inner, text=t, bg="white", font=("微软雅黑", 9), anchor="w", justify="left").grid(row=r, column=0, sticky="w", padx=6)
-            va = tk.BooleanVar(value=(t in a_set))
-            vc = tk.BooleanVar(value=(t in c_set))
-            vi = tk.BooleanVar(value=(t in i_set))
-            for col, v in ((1, va), (2, vc), (3, vi)):
-                tk.Checkbutton(inner, variable=v, bg="white", activebackground="white").grid(row=r, column=col, padx=6)
-            state[t] = (va, vc, vi)
+            per = {}
+            for i, (key, label) in enumerate(cols, start=1):
+                v = tk.BooleanVar(value=(t in (cur.get(key) or [])))
+                tk.Checkbutton(inner, variable=v, bg="white", activebackground="white").grid(row=r, column=i, padx=8)
+                per[key] = v
+            state[t] = per
         result = {"ok": False}
 
         def _ok():
@@ -2339,65 +2292,26 @@ class App:
         btns.pack(pady=8)
         tk.Button(btns, text="确定", width=10, command=_ok).pack(side=tk.LEFT, padx=6)
         tk.Button(btns, text="取消", width=10, command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        def _on_wheel(event, _c=canvas):
+            try:
+                _c.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+
+        win.bind("<MouseWheel>", _on_wheel)
+        win.grab_set()
+        win.lift()
+        win.focus_force()
         self.root.wait_window(win)
         if not result["ok"]:
             return None
-        amounts = [t for t in titles if state[t][0].get()]
-        cps = [t for t in titles if state[t][1].get()]
-        ids = [t for t in titles if state[t][2].get()]
-        return amounts, cps, ids
-
-    def _ask_roles(self, path):
-        """读该文件的表头，弹出三列勾选，返回 (amounts, cps, ids)；取消返回 None。"""
-        titles = self._collect_header_titles(path)
-
-        def split(var):
-            return [p.strip() for p in re.split(r"[，,、]+", var.get()) if p.strip()]
-
-        return self._pick_roles(titles, split(self.user_amount_titles),
-                                split(self.user_counterparty_titles),
-                                split(self.user_counterparty_id_titles))
-
-    def _ask_desensitize(self, path):
-        """读该文件的表头，弹出勾选，返回选中的列列表；取消返回 None。"""
-        titles = self._collect_header_titles(path)
-        cur = [p.strip() for p in re.split(r"[，,、]+", self.desensitize_titles.get()) if p.strip()]
-        picked = self._pick_titles(titles, initial=cur, title="选择要脱敏的列")
-        if picked is None:
-            return None
-        if not picked:
-            if not messagebox.askyesno("一列都没选",
-                                       "你没有勾选任何列，继续处理等于「不做脱敏」。\n确定要继续吗？"):
-                return None
-        return picked
-
-    def pick_manual_all(self):
-        path = self._ask_reference_file()
-        if not path:
-            return
-        picked = self._ask_roles(path)
-        if picked is None:
-            return
-        amounts, cps, ids = picked
-        self.user_amount_titles.set("，".join(amounts))
-        self.user_counterparty_titles.set("，".join(cps))
-        self.user_counterparty_id_titles.set("，".join(ids))
-        self._refresh_manual_picks()
-        log("手动勾选：金额=%s 名称=%s ID=%s" % (
-            "、".join(amounts) or "（无）", "、".join(cps) or "（无）", "、".join(ids) or "（无）"))
-
-    def choose_desensitize_columns(self, file_path=None):
-        if not isinstance(file_path, str) or not file_path:
-            file_path = self._ask_reference_file()
-            if not file_path:
-                return False
-        picked = self._ask_desensitize(file_path)
-        if picked is None:
-            return False
-        self.desensitize_titles.set("，".join(picked))
-        self._refresh_desensitize_pick()
-        log("脱敏列已选：%s" % ("、".join(picked) if picked else "（无）"))
-        return True
+        out = {}
+        for key, _label in cols:
+            out[key] = [t for t in titles if state[t][key].get()]
+        for key in ("amount", "cp", "id", "des"):
+            out.setdefault(key, [])
+        return out
 
 
     def select_files(self):
@@ -2413,6 +2327,11 @@ class App:
         need_manual = self.manual_mode.get()
         need_des = self.enable_desensitize.get()
         if need_manual or need_des:
+            need = []
+            if need_manual:
+                need += ["amount", "cp", "id"]
+            if need_des:
+                need += ["des"]
             groups = {}
             for fp in file_paths:
                 sig = tuple(self._collect_header_titles(fp))
@@ -2425,21 +2344,23 @@ class App:
             first_group = True
             for sig, files in groups.items():
                 rep = files[0]
-                if need_manual:
-                    picked = self._ask_roles(rep)
-                    if picked is None:
-                        messagebox.showinfo("已取消", "没有确认要用的列，本次不处理任何文件。")
+                cur = {
+                    "amount": self._split_var(self.user_amount_titles),
+                    "cp": self._split_var(self.user_counterparty_titles),
+                    "id": self._split_var(self.user_counterparty_id_titles),
+                    "des": self._split_var(self.desensitize_titles),
+                }
+                picked = self._pick_columns(self._collect_header_titles(rep), need, cur)
+                if picked is None:
+                    messagebox.showinfo("已取消", "没有确认要用的列，本次不处理任何文件。")
+                    return
+                amt = picked["amount"] if need_manual else []
+                cp = picked["cp"] if need_manual else []
+                cid = picked["id"] if need_manual else []
+                des = picked["des"] if need_des else []
+                if need_des and not des:
+                    if not messagebox.askyesno("一列都没选", "没有勾选任何脱敏列，继续处理等于「不做脱敏」。\\n确定要继续吗？"):
                         return
-                    amt, cp, cid = picked
-                else:
-                    amt, cp, cid = [], [], []
-                if need_des:
-                    des = self._ask_desensitize(rep)
-                    if des is None:
-                        messagebox.showinfo("已取消", "没有确认脱敏列，本次不处理任何文件。")
-                        return
-                else:
-                    des = []
                 for fp in files:
                     overrides[_norm_key(fp)] = (list(amt), list(cp), list(cid), list(des))
                 if first_group:
@@ -2451,6 +2372,7 @@ class App:
                     self._refresh_desensitize_pick()
                     first_group = False
         self.start_processing(file_paths, overrides)
+
 
     def start_processing(self, file_paths, overrides=None):
         self.processing = True
