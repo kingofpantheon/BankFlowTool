@@ -2234,7 +2234,7 @@ class App:
     def _split_var(self, var):
         return [p.strip() for p in re.split(r"[，,、]+", var.get()) if p.strip()]
 
-    def _pick_columns(self, titles, need, cur):
+    def _pick_columns(self, titles, need, cur, title_prefix=""):
         """统一勾选窗口：每个表头一行，列为 金额 / 名称 / ID / 脱敏（按 need 显示）。
 
         need: 可含 "amount" / "cp" / "id" / "des" 的子集；cur: 同键→已选列表。
@@ -2253,7 +2253,7 @@ class App:
         if "des" in need:
             cols.append(("des", "脱敏"))
         win = tk.Toplevel(self.root)
-        win.title("选择列（" + " / ".join(c[1] for c in cols) + "）")
+        win.title(title_prefix + "选择列（" + " / ".join(c[1] for c in cols) + "）")
         win.geometry("600x560")
         win.transient(self.root)
         tk.Label(win, text="每个表头一行；勾上它属于哪种列（可同时勾多种）：",
@@ -2342,15 +2342,21 @@ class App:
                     "选中的 %d 个文件里有 %d 种不同的表头，将逐个表头组分别设置列；\\n同一组文件只弹一次窗口。" % (
                         len(file_paths), len(groups)))
             first_group = True
-            for sig, files in groups.items():
+            group_list = list(groups.items())
+            for gi, (sig, files) in enumerate(group_list, start=1):
                 rep = files[0]
+                prefix = "第 %d/%d 组（%s）：" % (gi, len(group_list), Path(rep).name) if len(group_list) > 1 else ""
+                try:
+                    self.root.update()
+                except Exception:
+                    pass
                 cur = {
                     "amount": self._split_var(self.user_amount_titles),
                     "cp": self._split_var(self.user_counterparty_titles),
                     "id": self._split_var(self.user_counterparty_id_titles),
                     "des": self._split_var(self.desensitize_titles),
                 }
-                picked = self._pick_columns(self._collect_header_titles(rep), need, cur)
+                picked = self._pick_columns(self._collect_header_titles(rep), need, cur, title_prefix=prefix)
                 if picked is None:
                     messagebox.showinfo("已取消", "没有确认要用的列，本次不处理任何文件。")
                     return
