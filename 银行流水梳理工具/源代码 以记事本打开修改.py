@@ -39,6 +39,7 @@ import time
 import atexit
 import platform
 import datetime
+import json
 import logging
 import faulthandler
 import threading
@@ -1879,6 +1880,7 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
               manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
               enable_desensitize, desensitize_titles, enable_money_clean,
               progress_callback, finish_callback, overrides=None):
+    global desensitize_mapper
     # 每轮处理都从干净的映射表开始，避免上一轮的映射混进来
     desensitize_mapper = DesensitizeMapper()
     diagnostics.clear()
