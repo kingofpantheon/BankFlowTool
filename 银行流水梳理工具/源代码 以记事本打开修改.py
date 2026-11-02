@@ -905,6 +905,13 @@ _FULLWIDTH_TABLE = str.maketrans('０１２３４５６７８９．，－＋％'
 _CURRENCY_RE = re.compile(r'[¥￥$€£]')
 _AMOUNT_UNIT_RE = re.compile(r'(元整|元|圆|人民币|RMB|CNY|USD)$', re.IGNORECASE)
 
+def _norm_key(p):
+    try:
+        return os.path.normcase(os.path.abspath(str(p)))
+    except Exception:
+        return str(p)
+
+
 def parse_amount(cell_value):
     """把单元格值解析成 float；不像金额就返回 None。
 
@@ -1841,8 +1848,7 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
 def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summary,
               manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
               enable_desensitize, desensitize_titles, enable_money_clean,
-              progress_callback, finish_callback):
-    global desensitize_mapper
+              progress_callback, finish_callback, overrides=None):
     # 每轮处理都从干净的映射表开始，避免上一轮的映射混进来
     desensitize_mapper = DesensitizeMapper()
     diagnostics.clear()
@@ -1864,21 +1870,26 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
             file_path = Path(file_path_str)
             log(f"处理文件 {idx+1}/{total}: {file_path.name}")
             progress_callback(idx + 1, total, file_path.name)
+            if overrides and _norm_key(file_path) in overrides:
+                _ov = overrides[_norm_key(file_path)]
+                _amt, _cp, _cid, _des = _ov
+            else:
+                _amt, _cp, _cid, _des = (user_amount_titles, user_counterparty_titles, user_counterparty_id_titles, desensitize_titles)
             _t_file = time.time()
             try:
                 ext = file_path.suffix.lower()
                 if ext == '.csv':
                     out_path, data = process_csv(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
-                                                 manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                                                 enable_desensitize, desensitize_titles, enable_money_clean)
+                                                 manual_mode, _amt, _cp, _cid,
+                                                 enable_desensitize, _des, enable_money_clean)
                 elif ext == '.xls':
                     out_path, data = process_old_xls(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
-                                                     manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                                                     enable_desensitize, desensitize_titles, enable_money_clean)
+                                                     manual_mode, _amt, _cp, _cid,
+                                                     enable_desensitize, _des, enable_money_clean)
                 elif ext == '.xlsx':
                     out_path, data = process_xlsx(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
-                                                  manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                                                  enable_desensitize, desensitize_titles, enable_money_clean)
+                                                  manual_mode, _amt, _cp, _cid,
+                                                  enable_desensitize, _des, enable_money_clean)
                 else:
                     raise Exception(f"不支持的文件类型：{ext}")
             except Exception as e:
@@ -2243,6 +2254,12 @@ class App:
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
+        def _on_wheel(event, _c=canvas):
+            try:
+                _c.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+        win.bind("<MouseWheel>", _on_wheel)
         init = set(initial or [])
         vars_ = {}
         for t in titles:
@@ -2295,6 +2312,12 @@ class App:
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
+        def _on_wheel(event, _c=canvas):
+            try:
+                _c.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+        win.bind("<MouseWheel>", _on_wheel)
         for c, txt in ((0, "表头"), (1, "金额"), (2, "名称"), (3, "ID")):
             tk.Label(inner, text=txt, bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=c, sticky="w", padx=6, pady=2)
         state = {}
@@ -2324,17 +2347,35 @@ class App:
         ids = [t for t in titles if state[t][2].get()]
         return amounts, cps, ids
 
+    def _ask_roles(self, path):
+        """读该文件的表头，弹出三列勾选，返回 (amounts, cps, ids)；取消返回 None。"""
+        titles = self._collect_header_titles(path)
+
+        def split(var):
+            return [p.strip() for p in re.split(r"[，,、]+", var.get()) if p.strip()]
+
+        return self._pick_roles(titles, split(self.user_amount_titles),
+                                split(self.user_counterparty_titles),
+                                split(self.user_counterparty_id_titles))
+
+    def _ask_desensitize(self, path):
+        """读该文件的表头，弹出勾选，返回选中的列列表；取消返回 None。"""
+        titles = self._collect_header_titles(path)
+        cur = [p.strip() for p in re.split(r"[，,、]+", self.desensitize_titles.get()) if p.strip()]
+        picked = self._pick_titles(titles, initial=cur, title="选择要脱敏的列")
+        if picked is None:
+            return None
+        if not picked:
+            if not messagebox.askyesno("一列都没选",
+                                       "你没有勾选任何列，继续处理等于「不做脱敏」。\n确定要继续吗？"):
+                return None
+        return picked
+
     def pick_manual_all(self):
-        """一次选完：金额列 / 对手方名称列 / 对手方ID列。"""
         path = self._ask_reference_file()
         if not path:
             return
-        titles = self._collect_header_titles(path)
-        def split(var):
-            return [p.strip() for p in re.split(r"[，,、]+", var.get()) if p.strip()]
-        picked = self._pick_roles(titles, split(self.user_amount_titles),
-                                  split(self.user_counterparty_titles),
-                                  split(self.user_counterparty_id_titles))
+        picked = self._ask_roles(path)
         if picked is None:
             return
         amounts, cps, ids = picked
@@ -2346,20 +2387,13 @@ class App:
             "、".join(amounts) or "（无）", "、".join(cps) or "（无）", "、".join(ids) or "（无）"))
 
     def choose_desensitize_columns(self, file_path=None):
-        """选完文件后弹出勾选窗口，从真实表头里选要脱敏的列。"""
         if not isinstance(file_path, str) or not file_path:
             file_path = self._ask_reference_file()
             if not file_path:
                 return False
-        titles = self._collect_header_titles(file_path)
-        cur = [p.strip() for p in re.split(r"[，,、]+", self.desensitize_titles.get()) if p.strip()]
-        picked = self._pick_titles(titles, initial=cur, title="选择要脱敏的列")
+        picked = self._ask_desensitize(file_path)
         if picked is None:
             return False
-        if not picked:
-            if not messagebox.askyesno("一列都没选",
-                                       "你没有勾选任何列，继续处理等于「不做脱敏」。\n确定要继续吗？"):
-                return False
         self.desensitize_titles.set("，".join(picked))
         self._refresh_desensitize_pick()
         log("脱敏列已选：%s" % ("、".join(picked) if picked else "（无）"))
@@ -2373,16 +2407,52 @@ class App:
             title="选择要修复的文件（可多选）",
             filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")]
         )
-        if file_paths:
-            # 启用脱敏时：每次都拿「这次选的文件」的真实表头确认要脱敏的列，
-            # 避免上次选的列名在新文件里不存在 → 静默不脱敏。
-            if self.enable_desensitize.get():
-                if not self.choose_desensitize_columns(file_paths[0]):
-                    messagebox.showinfo("已取消", "没有确认脱敏列，本次不处理任何文件。")
-                    return
-            self.start_processing(file_paths)
+        if not file_paths:
+            return
+        overrides = {}
+        need_manual = self.manual_mode.get()
+        need_des = self.enable_desensitize.get()
+        if need_manual or need_des:
+            groups = {}
+            for fp in file_paths:
+                sig = tuple(self._collect_header_titles(fp))
+                groups.setdefault(sig, []).append(fp)
+            if len(groups) > 1:
+                messagebox.showinfo(
+                    "检测到 %d 种不同表头" % len(groups),
+                    "选中的 %d 个文件里有 %d 种不同的表头，将逐个表头组分别设置列；\\n同一组文件只弹一次窗口。" % (
+                        len(file_paths), len(groups)))
+            first_group = True
+            for sig, files in groups.items():
+                rep = files[0]
+                if need_manual:
+                    picked = self._ask_roles(rep)
+                    if picked is None:
+                        messagebox.showinfo("已取消", "没有确认要用的列，本次不处理任何文件。")
+                        return
+                    amt, cp, cid = picked
+                else:
+                    amt, cp, cid = [], [], []
+                if need_des:
+                    des = self._ask_desensitize(rep)
+                    if des is None:
+                        messagebox.showinfo("已取消", "没有确认脱敏列，本次不处理任何文件。")
+                        return
+                else:
+                    des = []
+                for fp in files:
+                    overrides[_norm_key(fp)] = (list(amt), list(cp), list(cid), list(des))
+                if first_group:
+                    self.user_amount_titles.set("，".join(amt))
+                    self.user_counterparty_titles.set("，".join(cp))
+                    self.user_counterparty_id_titles.set("，".join(cid))
+                    self.desensitize_titles.set("，".join(des))
+                    self._refresh_manual_picks()
+                    self._refresh_desensitize_pick()
+                    first_group = False
+        self.start_processing(file_paths, overrides)
 
-    def start_processing(self, file_paths):
+    def start_processing(self, file_paths, overrides=None):
         self.processing = True
         self.btn.config(state=tk.DISABLED)
         self.progress_win = tk.Toplevel(self.root)
@@ -2421,7 +2491,7 @@ class App:
             self.manual_mode.get(), user_amount, user_counterparty, user_counterparty_id,
             self.enable_desensitize.get(), desensitize_titles,
             self.enable_money_clean.get(),
-            update_progress, finish_callback
+            update_progress, finish_callback, overrides
         ))
         thread.daemon = True
         thread.start()
