@@ -905,6 +905,36 @@ _FULLWIDTH_TABLE = str.maketrans('０１２３４５６７８９．，－＋％'
 _CURRENCY_RE = re.compile(r'[¥￥$€£]')
 _AMOUNT_UNIT_RE = re.compile(r'(元整|元|圆|人民币|RMB|CNY|USD)$', re.IGNORECASE)
 
+_LAST_DIR_FILE = os.path.join(os.path.expanduser("~"), ".bankflow_lastdir.txt")
+_last_dir_cache = {"dir": ""}
+
+
+def remember_dir(path):
+    """记住最近的输出/映射目录，供还原时自动定位。"""
+    try:
+        d = os.path.dirname(os.path.abspath(str(path)))
+        _last_dir_cache["dir"] = d
+        with open(_LAST_DIR_FILE, "w", encoding="utf-8") as fh:
+            fh.write(d)
+    except Exception:
+        pass
+
+
+def last_dir(default=""):
+    """取上次记住的目录；没有就返回 default（或当前目录）。"""
+    try:
+        if _last_dir_cache["dir"] and os.path.isdir(_last_dir_cache["dir"]):
+            return _last_dir_cache["dir"]
+        if os.path.exists(_LAST_DIR_FILE):
+            with open(_LAST_DIR_FILE, encoding="utf-8") as fh:
+                d = fh.read().strip()
+            if d and os.path.isdir(d):
+                _last_dir_cache["dir"] = d
+                return d
+    except Exception:
+        pass
+    return default or os.getcwd()
+
 def _norm_key(p):
     try:
         return os.path.normcase(os.path.abspath(str(p)))
@@ -1899,6 +1929,7 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
                 continue
             log(f"文件处理完成：{file_path.name}（用时 {time.time() - _t_file:.1f} 秒）")
             processed_paths.append(out_path)
+            remember_dir(out_path)
             if enable_cross_summary:
                 all_collected.extend(data)
                 log(f"  收集到 {len(data)} 条对手方明细")
@@ -1908,6 +1939,7 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
             mapping_path = Path(file_paths[0]).parent / f"脱敏映射_{timestamp}.json"
             try:
                 desensitize_mapper.save_mapping(mapping_path)
+                remember_dir(mapping_path)
                 log(f"脱敏映射已保存至: {mapping_path}")
             except Exception as e:
                 mapping_path = None
@@ -1978,12 +2010,14 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
 def restore_file():
     file_path = filedialog.askopenfilename(
         title="请选择已脱敏的 Excel 或 CSV 文件",
+        initialdir=last_dir(),
         filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")]
     )
     if not file_path:
         return
     mapping_path = filedialog.askopenfilename(
         title="请选择对应的脱敏映射文件（.json）",
+        initialdir=os.path.dirname(os.path.abspath(file_path)) or last_dir(),
         filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
     )
     if not mapping_path:
@@ -2191,7 +2225,7 @@ class App:
                     text="已选 %d 列：%s（想换可直接重新选文件）" % (len(cur), "、".join(cur)), fg="#006400")
             else:
                 self.desensitize_pick.config(
-                    text="尚未选择列 —— 接下来点「选择文件」时会先弹窗让你从表头里勾选", fg="#b00020")
+                    text="", fg="#b00020")
         except Exception:
             pass
 
