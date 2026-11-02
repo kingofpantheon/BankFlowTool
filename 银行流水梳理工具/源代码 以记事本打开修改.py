@@ -2078,13 +2078,13 @@ class App:
         desensitize_cb = Checkbutton(self.desensitize_frame, text="启用信息脱敏", variable=self.enable_desensitize, bg="#f0f0f0", font=("微软雅黑", 10), command=self.toggle_desensitize_input)
         desensitize_cb.pack(anchor="w")
 
-        self.desensitize_label = Label(self.desensitize_frame, text="需要脱敏的列（点右侧按钮从表头勾选，不再手打标题）:", bg="#f0f0f0", font=("微软雅黑", 9))
-        self.desensitize_btn = Button(self.desensitize_frame, text="选择要脱敏的列…", command=self.choose_desensitize_columns,
-                                      font=("微软雅黑", 9), bg="#e0e0e0")
+        self.desensitize_label = Label(self.desensitize_frame,
+                                       text="勾选后：选完文件会先弹出「选择要脱敏的列」，从该文件的真实表头里勾选",
+                                       bg="#f0f0f0", font=("微软雅黑", 9), fg="#444444",
+                                       wraplength=620, justify="left")
         self.desensitize_pick = Label(self.desensitize_frame, text="", bg="#f0f0f0", font=("微软雅黑", 9),
                                       fg="#006400", wraplength=620, justify="left")
         self.desensitize_label.pack_forget()
-        self.desensitize_btn.pack_forget()
         self.desensitize_pick.pack_forget()
 
         row += 1
@@ -2163,22 +2163,22 @@ class App:
     def toggle_desensitize_input(self):
         if self.enable_desensitize.get():
             self.desensitize_label.pack(anchor="w", pady=(5, 0))
-            self.desensitize_btn.pack(anchor="w", pady=2)
             self._refresh_desensitize_pick()
             self.desensitize_pick.pack(anchor="w")
         else:
             self.desensitize_label.pack_forget()
-            self.desensitize_btn.pack_forget()
             self.desensitize_pick.pack_forget()
 
     def _refresh_desensitize_pick(self):
-        """把已选列显示在界面上；一列没选时显著提示。"""
+        """把已选列显示在界面上；还没选时说明下一步会做什么。"""
         cur = [p.strip() for p in re.split(r'[，,、]+', self.desensitize_titles.get()) if p.strip()]
         try:
             if cur:
-                self.desensitize_pick.config(text="已选 %d 列：%s" % (len(cur), "、".join(cur)), fg="#006400")
+                self.desensitize_pick.config(
+                    text="已选 %d 列：%s（想换可直接重新选文件）" % (len(cur), "、".join(cur)), fg="#006400")
             else:
-                self.desensitize_pick.config(text="尚未选择任何列 —— 不选就不会脱敏，请点上面的按钮勾选", fg="#b00020")
+                self.desensitize_pick.config(
+                    text="尚未选择列 —— 接下来点「选择文件」时会先弹窗让你从表头里勾选", fg="#b00020")
         except Exception:
             pass
 
@@ -2282,13 +2282,12 @@ class App:
             filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")]
         )
         if file_paths:
-            # 启用脱敏但还没选列 → 先用第一个文件的表头让用户勾选，避免“以为脱了其实没脱”
+            # 启用脱敏时：每次都拿「这次选的文件」的真实表头确认要脱敏的列，
+            # 避免上次选的列名在新文件里不存在 → 静默不脱敏。
             if self.enable_desensitize.get():
-                cur = [p.strip() for p in re.split(r'[，,、]+', self.desensitize_titles.get()) if p.strip()]
-                if not cur:
-                    if not self.choose_desensitize_columns(file_paths[0]):
-                        messagebox.showinfo("已取消", "没有选择脱敏列，本次不处理任何文件。")
-                        return
+                if not self.choose_desensitize_columns(file_paths[0]):
+                    messagebox.showinfo("已取消", "没有确认脱敏列，本次不处理任何文件。")
+                    return
             self.start_processing(file_paths)
 
     def start_processing(self, file_paths):
