@@ -2081,29 +2081,14 @@ class App:
                                 command=self.toggle_manual_input)
         manual_cb.pack(anchor="w")
 
-        self.amount_row = Frame(self.manual_frame, bg="#f0f0f0")
-        self.amount_btn = Button(self.amount_row, text="选择金额列…", font=("微软雅黑", 9), bg="#e0e0e0",
-                                 command=lambda: self.pick_manual("amount"))
-        self.amount_pick = Label(self.amount_row, text="", bg="#f0f0f0", font=("微软雅黑", 9), fg="#006400")
-        self.amount_btn.pack(side="left")
-        self.amount_pick.pack(side="left", padx=8)
-
-        self.cp_row = Frame(self.manual_frame, bg="#f0f0f0")
-        self.cp_btn = Button(self.cp_row, text="选择对手方名称列…", font=("微软雅黑", 9), bg="#e0e0e0",
-                             command=lambda: self.pick_manual("counterparty"))
-        self.cp_pick = Label(self.cp_row, text="", bg="#f0f0f0", font=("微软雅黑", 9), fg="#006400")
-        self.cp_btn.pack(side="left")
-        self.cp_pick.pack(side="left", padx=8)
-
-        self.cpid_row = Frame(self.manual_frame, bg="#f0f0f0")
-        self.cpid_btn = Button(self.cpid_row, text="选择对手方ID列…", font=("微软雅黑", 9), bg="#e0e0e0",
-                               command=lambda: self.pick_manual("counterparty_id"))
-        self.cpid_pick = Label(self.cpid_row, text="", bg="#f0f0f0", font=("微软雅黑", 9), fg="#006400")
-        self.cpid_btn.pack(side="left")
-        self.cpid_pick.pack(side="left", padx=8)
-
-        for w in (self.amount_row, self.cp_row, self.cpid_row):
-            w.pack_forget()
+        self.manual_row = Frame(self.manual_frame, bg="#f0f0f0")
+        self.manual_btn = Button(self.manual_row, text="选择列（金额 / 对手方名称 / 对手方ID）…",
+                                 font=("微软雅黑", 9), bg="#e0e0e0", command=self.pick_manual_all)
+        self.manual_pick = Label(self.manual_row, text="", bg="#f0f0f0", font=("微软雅黑", 9),
+                                 fg="#006400", wraplength=620, justify="left")
+        self.manual_btn.pack(side="left")
+        self.manual_pick.pack(side="left", padx=8)
+        self.manual_row.pack_forget()
 
         row += 1
         self.desensitize_frame = Frame(options_frame, bg="#f0f0f0")
@@ -2158,28 +2143,27 @@ class App:
         log_path_label.pack(pady=2)
 
     def toggle_manual_input(self):
-        rows = (self.amount_row, self.cp_row, self.cpid_row)
         if self.manual_mode.get():
-            for w in rows:
-                w.pack(anchor="w", pady=(4, 0))
+            self.manual_row.pack(anchor="w", pady=(4, 0))
             self._refresh_manual_picks()
         else:
-            for w in rows:
-                w.pack_forget()
+            self.manual_row.pack_forget()
 
     def _refresh_manual_picks(self):
-        pairs = (
-            (self.amount_pick, self.user_amount_titles, "金额列"),
-            (self.cp_pick, self.user_counterparty_titles, "对手方名称列"),
-            (self.cpid_pick, self.user_counterparty_id_titles, "对手方ID列"),
-        )
-        for lbl, var, name in pairs:
+        def fmt(var, label):
             v = (var.get() or "").strip()
-            try:
-                lbl.config(text=("已选：%s" % v) if v else ("未选 %s" % name),
-                           fg="#006400" if v else "#b00020")
-            except Exception:
-                pass
+            return "%s：%s" % (label, v) if v else "%s：未选" % label
+        text = "  ｜  ".join([
+            fmt(self.user_amount_titles, "金额"),
+            fmt(self.user_counterparty_titles, "名称"),
+            fmt(self.user_counterparty_id_titles, "ID"),
+        ])
+        done = all((var.get() or "").strip() for var in (
+            self.user_amount_titles, self.user_counterparty_titles, self.user_counterparty_id_titles))
+        try:
+            self.manual_pick.config(text=text, fg="#006400" if done else "#b00020")
+        except Exception:
+            pass
 
     def toggle_desensitize_input(self):
         if self.enable_desensitize.get():
@@ -2287,23 +2271,79 @@ class App:
             title="先选一份要处理的流水文件（用它列出可选列）",
             filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")])
 
-    def pick_manual(self, kind):
-        """手动勾选：金额列 / 对手方名称列 / 对手方ID列。"""
-        var_map = {"amount": self.user_amount_titles,
-                   "counterparty": self.user_counterparty_titles,
-                   "counterparty_id": self.user_counterparty_id_titles}
-        name_map = {"amount": "金额列", "counterparty": "对手方名称列", "counterparty_id": "对手方ID列"}
+    def _pick_roles(self, titles, cur_amount=(), cur_cp=(), cur_id=()):
+        """一个窗口里同时勾：哪个表头是金额列 / 对手方名称列 / 对手方ID列。取消返回 None。"""
+        if not titles:
+            messagebox.showwarning("列不出表头", "这份文件里没识别到表头行，无法列出可选的列。")
+            return None
+        a_set, c_set, i_set = set(cur_amount), set(cur_cp), set(cur_id)
+        win = tk.Toplevel(self.root)
+        win.title("选择列（金额 / 对手方名称 / 对手方ID）")
+        win.geometry("560x560")
+        win.transient(self.root)
+        tk.Label(win, text="每个表头一行，直接勾选它属于哪种列（可同时勾多种）：",
+                 font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=(10, 2))
+        tk.Label(win, text="提示：勾「金额」= 交易金额列；勾「名称」= 对手方名称列；勾「ID」= 对手方账户ID列。",
+                 font=("微软雅黑", 9), fg="#666666").pack(anchor="w", padx=10, pady=(0, 6))
+        holder = tk.Frame(win)
+        holder.pack(fill="both", expand=True, padx=10)
+        canvas = tk.Canvas(holder, borderwidth=0, highlightthickness=0, bg="white")
+        sb = tk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg="white")
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        for c, txt in ((0, "表头"), (1, "金额"), (2, "名称"), (3, "ID")):
+            tk.Label(inner, text=txt, bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=c, sticky="w", padx=6, pady=2)
+        state = {}
+        for r, t in enumerate(titles, start=1):
+            tk.Label(inner, text=t, bg="white", font=("微软雅黑", 9), anchor="w", justify="left").grid(row=r, column=0, sticky="w", padx=6)
+            va = tk.BooleanVar(value=(t in a_set))
+            vc = tk.BooleanVar(value=(t in c_set))
+            vi = tk.BooleanVar(value=(t in i_set))
+            for col, v in ((1, va), (2, vc), (3, vi)):
+                tk.Checkbutton(inner, variable=v, bg="white", activebackground="white").grid(row=r, column=col, padx=6)
+            state[t] = (va, vc, vi)
+        result = {"ok": False}
+
+        def _ok():
+            result["ok"] = True
+            win.destroy()
+
+        btns = tk.Frame(win)
+        btns.pack(pady=8)
+        tk.Button(btns, text="确定", width=10, command=_ok).pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="取消", width=10, command=win.destroy).pack(side=tk.LEFT, padx=6)
+        self.root.wait_window(win)
+        if not result["ok"]:
+            return None
+        amounts = [t for t in titles if state[t][0].get()]
+        cps = [t for t in titles if state[t][1].get()]
+        ids = [t for t in titles if state[t][2].get()]
+        return amounts, cps, ids
+
+    def pick_manual_all(self):
+        """一次选完：金额列 / 对手方名称列 / 对手方ID列。"""
         path = self._ask_reference_file()
         if not path:
             return
         titles = self._collect_header_titles(path)
-        cur = [p.strip() for p in re.split(r"[，,、]+", var_map[kind].get()) if p.strip()]
-        picked = self._pick_titles(titles, initial=cur, title="选择%s" % name_map[kind])
+        def split(var):
+            return [p.strip() for p in re.split(r"[，,、]+", var.get()) if p.strip()]
+        picked = self._pick_roles(titles, split(self.user_amount_titles),
+                                  split(self.user_counterparty_titles),
+                                  split(self.user_counterparty_id_titles))
         if picked is None:
             return
-        var_map[kind].set("，".join(picked))
+        amounts, cps, ids = picked
+        self.user_amount_titles.set("，".join(amounts))
+        self.user_counterparty_titles.set("，".join(cps))
+        self.user_counterparty_id_titles.set("，".join(ids))
         self._refresh_manual_picks()
-        log("手动选择%s：%s" % (name_map[kind], "、".join(picked) if picked else "（无）"))
+        log("手动勾选：金额=%s 名称=%s ID=%s" % (
+            "、".join(amounts) or "（无）", "、".join(cps) or "（无）", "、".join(ids) or "（无）"))
 
     def choose_desensitize_columns(self, file_path=None):
         """选完文件后弹出勾选窗口，从真实表头里选要脱敏的列。"""
