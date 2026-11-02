@@ -2073,6 +2073,39 @@ class App:
         cb_cross.grid(row=row, column=0, sticky="w", padx=10, pady=2)
         row += 1
 
+        row += 1
+        self.manual_frame = Frame(options_frame, bg="#f0f0f0")
+        self.manual_frame.grid(row=row, column=0, sticky="w", padx=10, pady=10)
+        manual_cb = Checkbutton(self.manual_frame, text="手动勾选（对手方流水自动识别失败时使用）",
+                                variable=self.manual_mode, bg="#f0f0f0", font=("微软雅黑", 10),
+                                command=self.toggle_manual_input)
+        manual_cb.pack(anchor="w")
+
+        self.amount_row = Frame(self.manual_frame, bg="#f0f0f0")
+        self.amount_btn = Button(self.amount_row, text="选择金额列…", font=("微软雅黑", 9), bg="#e0e0e0",
+                                 command=lambda: self.pick_manual("amount"))
+        self.amount_pick = Label(self.amount_row, text="", bg="#f0f0f0", font=("微软雅黑", 9), fg="#006400")
+        self.amount_btn.pack(side="left")
+        self.amount_pick.pack(side="left", padx=8)
+
+        self.cp_row = Frame(self.manual_frame, bg="#f0f0f0")
+        self.cp_btn = Button(self.cp_row, text="选择对手方名称列…", font=("微软雅黑", 9), bg="#e0e0e0",
+                             command=lambda: self.pick_manual("counterparty"))
+        self.cp_pick = Label(self.cp_row, text="", bg="#f0f0f0", font=("微软雅黑", 9), fg="#006400")
+        self.cp_btn.pack(side="left")
+        self.cp_pick.pack(side="left", padx=8)
+
+        self.cpid_row = Frame(self.manual_frame, bg="#f0f0f0")
+        self.cpid_btn = Button(self.cpid_row, text="选择对手方ID列…", font=("微软雅黑", 9), bg="#e0e0e0",
+                               command=lambda: self.pick_manual("counterparty_id"))
+        self.cpid_pick = Label(self.cpid_row, text="", bg="#f0f0f0", font=("微软雅黑", 9), fg="#006400")
+        self.cpid_btn.pack(side="left")
+        self.cpid_pick.pack(side="left", padx=8)
+
+        for w in (self.amount_row, self.cp_row, self.cpid_row):
+            w.pack_forget()
+
+        row += 1
         self.desensitize_frame = Frame(options_frame, bg="#f0f0f0")
         self.desensitize_frame.grid(row=row, column=0, sticky="w", padx=10, pady=10)
         desensitize_cb = Checkbutton(self.desensitize_frame, text="启用信息脱敏", variable=self.enable_desensitize, bg="#f0f0f0", font=("微软雅黑", 10), command=self.toggle_desensitize_input)
@@ -2087,27 +2120,7 @@ class App:
         self.desensitize_label.pack_forget()
         self.desensitize_pick.pack_forget()
 
-        row += 1
-        self.manual_frame = Frame(options_frame, bg="#f0f0f0")
-        self.manual_frame.grid(row=row, column=0, sticky="w", padx=10, pady=10)
-        manual_cb = Checkbutton(self.manual_frame, text="手动指定列（自动识别失败时使用）", variable=self.manual_mode, bg="#f0f0f0", font=("微软雅黑", 10), command=self.toggle_manual_input)
-        manual_cb.pack(anchor="w")
-
-        self.amount_label = Label(self.manual_frame, text="金额列标题（多个用逗号分隔）:", bg="#f0f0f0", font=("微软雅黑", 9))
-        self.amount_entry = Entry(self.manual_frame, textvariable=self.user_amount_titles, width=50, font=("微软雅黑", 9))
-        self.counterparty_label = Label(self.manual_frame, text="对手方名称列标题（多个用逗号分隔）:", bg="#f0f0f0", font=("微软雅黑", 9))
-        self.counterparty_entry = Entry(self.manual_frame, textvariable=self.user_counterparty_titles, width=50, font=("微软雅黑", 9))
-        self.counterparty_id_label = Label(self.manual_frame, text="对手方ID列标题（多个用逗号分隔）:", bg="#f0f0f0", font=("微软雅黑", 9))
-        self.counterparty_id_entry = Entry(self.manual_frame, textvariable=self.user_counterparty_id_titles, width=50, font=("微软雅黑", 9))
-
-        self.amount_label.pack_forget()
-        self.amount_entry.pack_forget()
-        self.counterparty_label.pack_forget()
-        self.counterparty_entry.pack_forget()
-        self.counterparty_id_label.pack_forget()
-        self.counterparty_id_entry.pack_forget()
-
-        note_label = tk.Label(root, text="提示：手动模式下，软件会优先使用您输入的标题查找对应列，若找不到则跳过该文件。脱敏列同样支持手动指定。",
+        note_label = tk.Label(root, text="提示：手动勾选模式下，金额列 / 对手方名称列 / 对手方ID列都用「点按钮从表头里勾选」的方式指定；找不到时会跳过该区块并写日志。脱敏列同样从表头勾选。",
                               bg="#f0f0f0", font=("微软雅黑", 9), fg="blue", wraplength=600)
         note_label.pack(pady=5)
 
@@ -2145,20 +2158,28 @@ class App:
         log_path_label.pack(pady=2)
 
     def toggle_manual_input(self):
+        rows = (self.amount_row, self.cp_row, self.cpid_row)
         if self.manual_mode.get():
-            self.amount_label.pack(anchor="w", pady=(5,0))
-            self.amount_entry.pack(anchor="w", pady=2)
-            self.counterparty_label.pack(anchor="w", pady=(5,0))
-            self.counterparty_entry.pack(anchor="w", pady=2)
-            self.counterparty_id_label.pack(anchor="w", pady=(5,0))
-            self.counterparty_id_entry.pack(anchor="w", pady=2)
+            for w in rows:
+                w.pack(anchor="w", pady=(4, 0))
+            self._refresh_manual_picks()
         else:
-            self.amount_label.pack_forget()
-            self.amount_entry.pack_forget()
-            self.counterparty_label.pack_forget()
-            self.counterparty_entry.pack_forget()
-            self.counterparty_id_label.pack_forget()
-            self.counterparty_id_entry.pack_forget()
+            for w in rows:
+                w.pack_forget()
+
+    def _refresh_manual_picks(self):
+        pairs = (
+            (self.amount_pick, self.user_amount_titles, "金额列"),
+            (self.cp_pick, self.user_counterparty_titles, "对手方名称列"),
+            (self.cpid_pick, self.user_counterparty_id_titles, "对手方ID列"),
+        )
+        for lbl, var, name in pairs:
+            v = (var.get() or "").strip()
+            try:
+                lbl.config(text=("已选：%s" % v) if v else ("未选 %s" % name),
+                           fg="#006400" if v else "#b00020")
+            except Exception:
+                pass
 
     def toggle_desensitize_input(self):
         if self.enable_desensitize.get():
@@ -2218,41 +2239,37 @@ class App:
             except Exception:
                 pass
         return titles
-
-    def choose_desensitize_columns(self, file_path=None):
-        """弹出勾选窗口，让用户从真实表头里选要脱敏的列（替代手打标题）。"""
-        if not isinstance(file_path, str) or not file_path:
-            file_path = filedialog.askopenfilename(
-                title="选择一份要处理的文件（用它的表头列出可选的列）",
-                filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")])
-            if not file_path:
-                return False
-        titles = self._collect_header_titles(file_path)
+    def _pick_titles(self, titles, initial=None, title="选择列", hint="单击一行即可勾选/取消（可多选）："):
+        """通用勾选窗口：一行一个勾选框，单击切换，返回选中列表；取消返回 None。"""
         if not titles:
-            messagebox.showwarning(
-                "列不出表头",
-                "这份文件里没识别到表头行，无法列出可脱敏的列。\n可以换一份文件，或用「手动指定列」。")
-            return False
-
+            messagebox.showwarning("列不出表头", "这份文件里没识别到表头行，无法列出可选的列。")
+            return None
         win = tk.Toplevel(self.root)
-        win.title("选择要脱敏的列")
-        win.geometry("430x500")
+        win.title(title)
+        win.geometry("440x520")
         win.transient(self.root)
-        tk.Label(win, text="勾选需要脱敏的列（可多选，Ctrl/Shift 连选）：",
-                 font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=8)
-        lb = tk.Listbox(win, selectmode=tk.MULTIPLE, font=("微软雅黑", 9), activestyle="none")
+        tk.Label(win, text=hint, font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=(10, 4))
+        holder = tk.Frame(win)
+        holder.pack(fill="both", expand=True, padx=10)
+        canvas = tk.Canvas(holder, borderwidth=0, highlightthickness=0, bg="white")
+        sb = tk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg="white")
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        init = set(initial or [])
+        vars_ = {}
         for t in titles:
-            lb.insert(tk.END, t)
-        lb.pack(fill="both", expand=True, padx=10)
-        current = [p.strip() for p in re.split(r'[，,、]+', self.desensitize_titles.get()) if p.strip()]
-        for i, t in enumerate(titles):
-            if t in current:
-                lb.selection_set(i)
-
-        result = {"ok": False, "sel": []}
+            v = tk.BooleanVar(value=(t in init))
+            tk.Checkbutton(inner, text=t, variable=v, bg="white", anchor="w",
+                           font=("微软雅黑", 9), justify="left",
+                           activebackground="white").pack(fill="x", anchor="w")
+            vars_[t] = v
+        result = {"ok": False}
 
         def _ok():
-            result["sel"] = [titles[i] for i in lb.curselection()]
             result["ok"] = True
             win.destroy()
 
@@ -2262,9 +2279,43 @@ class App:
         tk.Button(btns, text="取消", width=10, command=win.destroy).pack(side=tk.LEFT, padx=6)
         self.root.wait_window(win)
         if not result["ok"]:
-            return False
+            return None
+        return [t for t in titles if vars_[t].get()]
 
-        picked = result["sel"]
+    def _ask_reference_file(self):
+        return filedialog.askopenfilename(
+            title="先选一份要处理的流水文件（用它列出可选列）",
+            filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")])
+
+    def pick_manual(self, kind):
+        """手动勾选：金额列 / 对手方名称列 / 对手方ID列。"""
+        var_map = {"amount": self.user_amount_titles,
+                   "counterparty": self.user_counterparty_titles,
+                   "counterparty_id": self.user_counterparty_id_titles}
+        name_map = {"amount": "金额列", "counterparty": "对手方名称列", "counterparty_id": "对手方ID列"}
+        path = self._ask_reference_file()
+        if not path:
+            return
+        titles = self._collect_header_titles(path)
+        cur = [p.strip() for p in re.split(r"[，,、]+", var_map[kind].get()) if p.strip()]
+        picked = self._pick_titles(titles, initial=cur, title="选择%s" % name_map[kind])
+        if picked is None:
+            return
+        var_map[kind].set("，".join(picked))
+        self._refresh_manual_picks()
+        log("手动选择%s：%s" % (name_map[kind], "、".join(picked) if picked else "（无）"))
+
+    def choose_desensitize_columns(self, file_path=None):
+        """选完文件后弹出勾选窗口，从真实表头里选要脱敏的列。"""
+        if not isinstance(file_path, str) or not file_path:
+            file_path = self._ask_reference_file()
+            if not file_path:
+                return False
+        titles = self._collect_header_titles(file_path)
+        cur = [p.strip() for p in re.split(r"[，,、]+", self.desensitize_titles.get()) if p.strip()]
+        picked = self._pick_titles(titles, initial=cur, title="选择要脱敏的列")
+        if picked is None:
+            return False
         if not picked:
             if not messagebox.askyesno("一列都没选",
                                        "你没有勾选任何列，继续处理等于「不做脱敏」。\n确定要继续吗？"):
@@ -2273,6 +2324,7 @@ class App:
         self._refresh_desensitize_pick()
         log("脱敏列已选：%s" % ("、".join(picked) if picked else "（无）"))
         return True
+
 
     def select_files(self):
         if self.processing:
