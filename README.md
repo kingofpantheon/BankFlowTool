@@ -48,7 +48,10 @@
 
 ### 方式一：直接使用打包好的 exe（无需 Python 环境）
 
-1. 进入 [Releases](../../releases) 页面，下载最新版 银行流水梳理工具.exe
+1. 进入 [Releases](../../releases) 页面，下载最新版 **`BankFlowTool_V1.7.0.exe`**
+   - 直链：`https://github.com/kingofpantheon/BankFlowTool/releases/download/v1.7.0/BankFlowTool_V1.7.0.exe`
+   - 说明：GitHub 会把发布资产名里的中文替换成下划线，所以资产用英文名；程序标题、界面与日志文件名仍是中文的「银行流水梳理工具」
+   - SHA256：`62F9D6A6A6566129CB550EE2890C5B370B23A6BAECCCCF5C6092D4F2C8F1FB09`
 2. 双击运行，GUI 界面操作，按提示选择流水文件即可
 
 ### 方式二：修改源代码（需 Python 3.8+）
