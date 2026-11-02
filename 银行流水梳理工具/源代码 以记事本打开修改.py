@@ -2126,11 +2126,6 @@ class App:
                                 command=self.toggle_manual_input)
         manual_cb.pack(anchor="w")
 
-        self.manual_row = Frame(self.manual_frame, bg="#f0f0f0")
-        self.manual_pick = Label(self.manual_row, text="", bg="#f0f0f0", font=("微软雅黑", 9),
-                                 fg="#006400", wraplength=620, justify="left")
-        self.manual_pick.pack(anchor="w")
-        self.manual_row.pack_forget()
 
         row += 1
         self.desensitize_frame = Frame(options_frame, bg="#f0f0f0")
@@ -2138,18 +2133,10 @@ class App:
         desensitize_cb = Checkbutton(self.desensitize_frame, text="启用信息脱敏", variable=self.enable_desensitize, bg="#f0f0f0", font=("微软雅黑", 10), command=self.toggle_desensitize_input)
         desensitize_cb.pack(anchor="w")
 
-        self.desensitize_label = Label(self.desensitize_frame,
-                                       text="勾选后：选完文件会先弹出「选择要脱敏的列」，从该文件的真实表头里勾选",
-                                       bg="#f0f0f0", font=("微软雅黑", 9), fg="#444444",
-                                       wraplength=620, justify="left")
         self.desensitize_pick = Label(self.desensitize_frame, text="", bg="#f0f0f0", font=("微软雅黑", 9),
                                       fg="#006400", wraplength=620, justify="left")
-        self.desensitize_label.pack_forget()
         self.desensitize_pick.pack_forget()
 
-        note_label = tk.Label(root, text="提示：手动勾选模式下，金额列 / 对手方名称列 / 对手方ID列都用「点按钮从表头里勾选」的方式指定；找不到时会跳过该区块并写日志。脱敏列同样从表头勾选。",
-                              bg="#f0f0f0", font=("微软雅黑", 9), fg="blue", wraplength=600)
-        note_label.pack(pady=5)
 
         btn_frame = tk.Frame(root, bg="#f0f0f0")
         btn_frame.pack(pady=10)
@@ -2185,49 +2172,17 @@ class App:
         log_path_label.pack(pady=2)
 
     def toggle_manual_input(self):
-        if self.manual_mode.get():
-            self.manual_row.pack(anchor="w", pady=(4, 0))
-            self._refresh_manual_picks()
-        else:
-            self.manual_row.pack_forget()
+        # 勾选状态本身即可，界面上不再附加文字提示；选文件时会弹出勾选窗口
+        pass
 
     def _refresh_manual_picks(self):
-        def fmt(var, label):
-            v = (var.get() or "").strip()
-            return "%s：%s" % (label, v) if v else "%s：未选" % label
-        text = "  ｜  ".join([
-            fmt(self.user_amount_titles, "金额"),
-            fmt(self.user_counterparty_titles, "名称"),
-            fmt(self.user_counterparty_id_titles, "ID"),
-        ])
-        done = all((var.get() or "").strip() for var in (
-            self.user_amount_titles, self.user_counterparty_titles, self.user_counterparty_id_titles))
-        try:
-            self.manual_pick.config(text=text, fg="#006400" if done else "#b00020")
-        except Exception:
-            pass
+        pass
 
     def toggle_desensitize_input(self):
-        if self.enable_desensitize.get():
-            self.desensitize_label.pack(anchor="w", pady=(5, 0))
-            self._refresh_desensitize_pick()
-            self.desensitize_pick.pack(anchor="w")
-        else:
-            self.desensitize_label.pack_forget()
-            self.desensitize_pick.pack_forget()
+        pass
 
     def _refresh_desensitize_pick(self):
-        """把已选列显示在界面上；还没选时说明下一步会做什么。"""
-        cur = [p.strip() for p in re.split(r'[，,、]+', self.desensitize_titles.get()) if p.strip()]
-        try:
-            if cur:
-                self.desensitize_pick.config(
-                    text="已选 %d 列：%s（想换可直接重新选文件）" % (len(cur), "、".join(cur)), fg="#006400")
-            else:
-                self.desensitize_pick.config(
-                    text="", fg="#b00020")
-        except Exception:
-            pass
+        pass
 
     def _collect_header_titles(self, file_path):
         """读取文件，返回所有非统计工作表的表头列名（去重、保序）。"""
