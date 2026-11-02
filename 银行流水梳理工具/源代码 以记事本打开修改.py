@@ -2078,10 +2078,14 @@ class App:
         desensitize_cb = Checkbutton(self.desensitize_frame, text="启用信息脱敏", variable=self.enable_desensitize, bg="#f0f0f0", font=("微软雅黑", 10), command=self.toggle_desensitize_input)
         desensitize_cb.pack(anchor="w")
 
-        self.desensitize_label = Label(self.desensitize_frame, text="需要脱敏的列标题（多个用逗号分隔）:", bg="#f0f0f0", font=("微软雅黑", 9))
-        self.desensitize_entry = Entry(self.desensitize_frame, textvariable=self.desensitize_titles, width=60, font=("微软雅黑", 9))
+        self.desensitize_label = Label(self.desensitize_frame, text="需要脱敏的列（点右侧按钮从表头勾选，不再手打标题）:", bg="#f0f0f0", font=("微软雅黑", 9))
+        self.desensitize_btn = Button(self.desensitize_frame, text="选择要脱敏的列…", command=self.choose_desensitize_columns,
+                                      font=("微软雅黑", 9), bg="#e0e0e0")
+        self.desensitize_pick = Label(self.desensitize_frame, text="", bg="#f0f0f0", font=("微软雅黑", 9),
+                                      fg="#006400", wraplength=620, justify="left")
         self.desensitize_label.pack_forget()
-        self.desensitize_entry.pack_forget()
+        self.desensitize_btn.pack_forget()
+        self.desensitize_pick.pack_forget()
 
         row += 1
         self.manual_frame = Frame(options_frame, bg="#f0f0f0")
@@ -2158,11 +2162,117 @@ class App:
 
     def toggle_desensitize_input(self):
         if self.enable_desensitize.get():
-            self.desensitize_label.pack(anchor="w", pady=(5,0))
-            self.desensitize_entry.pack(anchor="w", pady=2)
+            self.desensitize_label.pack(anchor="w", pady=(5, 0))
+            self.desensitize_btn.pack(anchor="w", pady=2)
+            self._refresh_desensitize_pick()
+            self.desensitize_pick.pack(anchor="w")
         else:
             self.desensitize_label.pack_forget()
-            self.desensitize_entry.pack_forget()
+            self.desensitize_btn.pack_forget()
+            self.desensitize_pick.pack_forget()
+
+    def _refresh_desensitize_pick(self):
+        """把已选列显示在界面上；一列没选时显著提示。"""
+        cur = [p.strip() for p in re.split(r'[，,、]+', self.desensitize_titles.get()) if p.strip()]
+        try:
+            if cur:
+                self.desensitize_pick.config(text="已选 %d 列：%s" % (len(cur), "、".join(cur)), fg="#006400")
+            else:
+                self.desensitize_pick.config(text="尚未选择任何列 —— 不选就不会脱敏，请点上面的按钮勾选", fg="#b00020")
+        except Exception:
+            pass
+
+    def _collect_header_titles(self, file_path):
+        """读取文件，返回所有非统计工作表的表头列名（去重、保序）。"""
+        titles = []
+        wb = None
+        try:
+            ext = str(file_path).lower()
+            if ext.endswith('.csv'):
+                wb = grid_to_workbook(read_csv_grid(file_path))
+            else:
+                wb = load_workbook(file_path, data_only=True)
+        except Exception as exc:
+            warn("读取表头失败：%s" % exc)
+            return titles
+        try:
+            for ws in wb.worksheets:
+                if is_stat_sheet_name(ws.title):
+                    continue
+                try:
+                    hr = detect_header_row(ws, ws.max_row, ws.max_column)
+                except Exception:
+                    continue
+                if not hr:
+                    continue
+                for c in range(1, ws.max_column + 1):
+                    v = ws.cell(row=hr, column=c).value
+                    if v is None:
+                        continue
+                    t = cell_text(v)
+                    if t and t not in titles:
+                        titles.append(t)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+        return titles
+
+    def choose_desensitize_columns(self, file_path=None):
+        """弹出勾选窗口，让用户从真实表头里选要脱敏的列（替代手打标题）。"""
+        if not isinstance(file_path, str) or not file_path:
+            file_path = filedialog.askopenfilename(
+                title="选择一份要处理的文件（用它的表头列出可选的列）",
+                filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")])
+            if not file_path:
+                return False
+        titles = self._collect_header_titles(file_path)
+        if not titles:
+            messagebox.showwarning(
+                "列不出表头",
+                "这份文件里没识别到表头行，无法列出可脱敏的列。\n可以换一份文件，或用「手动指定列」。")
+            return False
+
+        win = tk.Toplevel(self.root)
+        win.title("选择要脱敏的列")
+        win.geometry("430x500")
+        win.transient(self.root)
+        tk.Label(win, text="勾选需要脱敏的列（可多选，Ctrl/Shift 连选）：",
+                 font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=8)
+        lb = tk.Listbox(win, selectmode=tk.MULTIPLE, font=("微软雅黑", 9), activestyle="none")
+        for t in titles:
+            lb.insert(tk.END, t)
+        lb.pack(fill="both", expand=True, padx=10)
+        current = [p.strip() for p in re.split(r'[，,、]+', self.desensitize_titles.get()) if p.strip()]
+        for i, t in enumerate(titles):
+            if t in current:
+                lb.selection_set(i)
+
+        result = {"ok": False, "sel": []}
+
+        def _ok():
+            result["sel"] = [titles[i] for i in lb.curselection()]
+            result["ok"] = True
+            win.destroy()
+
+        btns = tk.Frame(win)
+        btns.pack(pady=8)
+        tk.Button(btns, text="确定", width=10, command=_ok).pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="取消", width=10, command=win.destroy).pack(side=tk.LEFT, padx=6)
+        self.root.wait_window(win)
+        if not result["ok"]:
+            return False
+
+        picked = result["sel"]
+        if not picked:
+            if not messagebox.askyesno("一列都没选",
+                                       "你没有勾选任何列，继续处理等于「不做脱敏」。\n确定要继续吗？"):
+                return False
+        self.desensitize_titles.set("，".join(picked))
+        self._refresh_desensitize_pick()
+        log("脱敏列已选：%s" % ("、".join(picked) if picked else "（无）"))
+        return True
 
     def select_files(self):
         if self.processing:
@@ -2172,6 +2282,13 @@ class App:
             filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")]
         )
         if file_paths:
+            # 启用脱敏但还没选列 → 先用第一个文件的表头让用户勾选，避免“以为脱了其实没脱”
+            if self.enable_desensitize.get():
+                cur = [p.strip() for p in re.split(r'[，,、]+', self.desensitize_titles.get()) if p.strip()]
+                if not cur:
+                    if not self.choose_desensitize_columns(file_paths[0]):
+                        messagebox.showinfo("已取消", "没有选择脱敏列，本次不处理任何文件。")
+                        return
             self.start_processing(file_paths)
 
     def start_processing(self, file_paths):
