@@ -214,6 +214,30 @@ def _copy_log_to(target):
         return False
 
 
+LOG_HISTORY_KEEP = 4   # 除当前日志外，再保留最近 4 次（合计 5 次）
+
+
+def _history_path(path, idx):
+    base, ext = os.path.splitext(path)
+    return "%s_历史%d%s" % (base, idx, ext)
+
+
+def _rotate_logs(path):
+    """把当前日志挪成_历史1，旧的依次后移，只保留最近 LOG_HISTORY_KEEP 份历史。"""
+    try:
+        last = _history_path(path, LOG_HISTORY_KEEP)
+        if os.path.exists(last):
+            os.remove(last)
+        for i in range(LOG_HISTORY_KEEP - 1, 0, -1):
+            src = _history_path(path, i)
+            if os.path.exists(src):
+                os.replace(src, _history_path(path, i + 1))
+        if os.path.exists(path):
+            os.replace(path, _history_path(path, 1))
+    except Exception:
+        pass
+
+
 def _open_log_file():
     """挑目录并打开日志；返回 (路径, 文件对象, 旧日志内容, 上次是否正常退出)。"""
     global _prev_was_abnormal
@@ -225,6 +249,7 @@ def _open_log_file():
         prev_tail = _read_tail(path, CARRY_OVER_BYTES)
         prev_clean = True if not prev_tail.strip() else (_EXIT_SENTINEL in prev_tail)
         try:
+            _rotate_logs(path)
             # "w" = 每次启动覆盖重写；buffering=1 = 行缓冲，每写一行就落盘
             fp = open(path, "w", encoding="utf-8", buffering=1)
         except Exception:
