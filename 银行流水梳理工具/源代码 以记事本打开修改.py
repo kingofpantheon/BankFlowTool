@@ -747,6 +747,7 @@ try:
     from openpyxl.utils import get_column_letter
     import tkinter as tk
     from tkinter import messagebox, filedialog, BooleanVar, Entry, Label, Frame, Checkbutton, Button
+    from tkinter import ttk
     from pathlib import Path
     import re
     import io
@@ -1165,6 +1166,34 @@ HEADER_KEYWORDS = [
     '第三方账户', '银行名称', '基金公司', '间联', '备注'
 ]
 
+def _generic_header_score(ws, row, scan_cols):
+    """通用（非银行流水）表头打分：短文本、非数字、非日期、非空。"""
+    score = 0
+    for col in range(1, scan_cols + 1):
+        v = ws.cell(row, col).value
+        if v is None:
+            continue
+        if isinstance(v, (int, float, bool, datetime.date, datetime.datetime)):
+            continue
+        s = str(v).strip()
+        if not s or len(s) > 20:
+            continue
+        if parse_amount(s) is not None:
+            continue
+        score += 1
+    return score
+
+
+def _detect_generic_header_row(ws, max_row, scan_cols, max_scan=20):
+    """关键词全不命中时，找最像表头的一行。返回 (row, score)。"""
+    best_row, best = 1, 0
+    for row in range(1, min(max_row, max_scan) + 1):
+        s = _generic_header_score(ws, row, scan_cols)
+        if s > best:
+            best_row, best = row, s
+    return best_row, best
+
+
 def _header_score(ws, row, scan_cols):
     score = 0
     for col in range(1, scan_cols + 1):
@@ -1208,9 +1237,15 @@ def detect_header_row(ws, max_row, max_col, max_scan_rows=80):
                 if best_score >= 3:
                     break
     if best_score < 2:
+        # 银行关键词一个都没命中：多半是普通表格（单独用脱敏时很常见）。
+        # 退到通用规则找"最像表头的一行"，并明确告诉用户可以改。
+        gen_row, gen_score = _detect_generic_header_row(ws, max_row, scan_cols)
         _sheet_ctx["header_score"] = best_score
-        log(f"未识别到明显的表头行（前 {min(max_row, 500)} 行关键词命中数仅 {best_score}），"
-            f"已按第 1 行处理；该工作表很可能整体被跳过")
+        if gen_score >= 2:
+            log(f"未命中银行表头关键词，按通用规则推测表头为第 {gen_row} 行"
+                f"（{gen_score} 个文本列）；不对的话在选列窗口里改表头行")
+            return gen_row
+        log(f"未识别到明显的表头行（关键词命中数 {best_score}，文本列也少于 2 个），已按第 1 行处理")
         return 1
     _sheet_ctx["header_score"] = best_score
     if best_score < 4:
@@ -1697,6 +1732,42 @@ def write_stat_block(ws, start_row, title, name_stats, name_id_stats, totals=Non
     current_row += 1
     return current_row
 
+
+def _mask_already(value):
+    """单元格是不是已经被本轮的脱敏表替换过（防止二次脱敏）。"""
+    try:
+        return str(value) in desensitize_mapper.mask_to_orig
+    except Exception:
+        return False
+
+
+def _mask_columns_whole(ws, header_row, cols):
+    """把指定列在表头之后的所有非空单元格脱敏，不依赖流水区块。
+
+    通用表格（没有金额列、切不出区块）单独用脱敏时走这条路。
+    """
+    n = 0
+    if not cols:
+        return n
+    start = int(header_row or 1) + 1
+    max_row = ws.max_row
+    for col in cols:
+        if col is None:
+            continue
+        for row in range(start, max_row + 1):
+            cell = ws.cell(row=row, column=col)
+            v = cell.value
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            if _mask_already(v):
+                continue
+            cell.value = desensitize_mapper.mask(v)
+            n += 1
+    return n
+
+
 def process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stats, collect_data,
                            manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
                            enable_desensitize, desensitize_cols, enable_money_clean, header_row=None):
@@ -1711,6 +1782,12 @@ def process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stat
 
     if header_row is None:
         header_row = detect_header_row(ws, max_row, max_col)
+
+    # 脱敏独立于流水区块：整列脱敏先做，通用表格也能用
+    if enable_desensitize and desensitize_cols:
+        _n_masked = _mask_columns_whole(ws, header_row, desensitize_cols)
+        if _n_masked:
+            log(f"脱敏：工作表「{sheet_name}」共处理 {_n_masked} 个单元格")
     # 表头都没识别出来，说明这张表多半不是流水表：细节只写日志，不刷屏
     _sheet_ctx["sheet"] = sheet_name
     _sheet_ctx["quiet"] = _sheet_ctx["header_score"] < 2
@@ -1832,12 +1909,12 @@ def resolve_desensitize_cols(ws, max_col, header_row, enable_desensitize, desens
 
 def process_csv(file_path, enable_sum, enable_internal_stats, collect_data,
                 manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                enable_desensitize, desensitize_titles, enable_money_clean):
+                enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None):
     file_path = Path(file_path)
     rows = read_csv_grid(file_path)
     wb = grid_to_workbook(rows)
     ws = wb.active
-    header_row = detect_header_row(ws, ws.max_row, ws.max_column)
+    header_row = (header_rows or {}).get('Sheet1') or detect_header_row(ws, ws.max_row, ws.max_column)
     desensitize_cols = resolve_desensitize_cols(ws, ws.max_column, header_row,
                                                 enable_desensitize, desensitize_titles)
     data = process_worksheet_multi(ws, wb, "Sheet1", enable_sum, enable_internal_stats, collect_data,
@@ -1849,7 +1926,7 @@ def process_csv(file_path, enable_sum, enable_internal_stats, collect_data,
 
 def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
                     manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                    enable_desensitize, desensitize_titles, enable_money_clean):
+                    enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None):
     file_path = Path(file_path)
     try:
         df = pd.read_excel(file_path, header=None, dtype=str, engine='xlrd')
@@ -1858,7 +1935,7 @@ def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
     df = df.astype(object).where(pd.notna(df), None)
     wb = grid_to_workbook(df.values.tolist())
     ws = wb.active
-    header_row = detect_header_row(ws, ws.max_row, ws.max_column)
+    header_row = (header_rows or {}).get('Sheet1') or detect_header_row(ws, ws.max_row, ws.max_column)
     desensitize_cols = resolve_desensitize_cols(ws, ws.max_column, header_row,
                                                 enable_desensitize, desensitize_titles)
     data = process_worksheet_multi(ws, wb, "Sheet1", enable_sum, enable_internal_stats, collect_data,
@@ -1870,7 +1947,7 @@ def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
 
 def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
                  manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                 enable_desensitize, desensitize_titles, enable_money_clean):
+                 enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None):
     file_path = Path(file_path)
     wb = load_workbook(file_path, data_only=True)
     all_data = []
@@ -1881,7 +1958,7 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
             continue
         ws = wb[sheet_name]
         try:
-            header_row = detect_header_row(ws, ws.max_row, ws.max_column)
+            header_row = (header_rows or {}).get(sheet_name) or detect_header_row(ws, ws.max_row, ws.max_column)
             desensitize_cols = []
             if enable_desensitize and desensitize_titles:
                 for title in desensitize_titles:
@@ -1927,9 +2004,12 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
             file_path = Path(file_path_str)
             log(f"处理文件 {idx+1}/{total}: {file_path.name}")
             progress_callback(idx + 1, total, file_path.name)
+            _hr = None
             if overrides and _norm_key(file_path) in overrides:
                 _ov = overrides[_norm_key(file_path)]
-                _amt, _cp, _cid, _des = _ov
+                _amt, _cp, _cid, _des = _ov[0], _ov[1], _ov[2], _ov[3]
+                if len(_ov) >= 5:
+                    _hr = _ov[4]
             else:
                 _amt, _cp, _cid, _des = (user_amount_titles, user_counterparty_titles, user_counterparty_id_titles, desensitize_titles)
             _t_file = time.time()
@@ -1938,15 +2018,15 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
                 if ext == '.csv':
                     out_path, data = process_csv(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
                                                  manual_mode, _amt, _cp, _cid,
-                                                 enable_desensitize, _des, enable_money_clean)
+                                                 enable_desensitize, _des, enable_money_clean, header_rows=_hr)
                 elif ext == '.xls':
                     out_path, data = process_old_xls(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
                                                      manual_mode, _amt, _cp, _cid,
-                                                     enable_desensitize, _des, enable_money_clean)
+                                                     enable_desensitize, _des, enable_money_clean, header_rows=_hr)
                 elif ext == '.xlsx':
                     out_path, data = process_xlsx(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
                                                   manual_mode, _amt, _cp, _cid,
-                                                  enable_desensitize, _des, enable_money_clean)
+                                                  enable_desensitize, _des, enable_money_clean, header_rows=_hr)
                 else:
                     raise Exception(f"不支持的文件类型：{ext}")
             except Exception as e:
@@ -2211,54 +2291,85 @@ class App:
     def _refresh_desensitize_pick(self):
         pass
 
-    def _collect_header_titles(self, file_path):
-        """读取文件，返回所有非统计工作表的表头列名（去重、保序）。"""
-        titles = []
-        wb = None
+    def _open_wb(self, file_path):
+        ext = str(file_path).lower()
+        if ext.endswith('.csv'):
+            return grid_to_workbook(read_csv_grid(file_path))
+        return load_workbook(file_path, data_only=True)
+
+    def _sheet_names(self, file_path):
+        """非统计工作表名列表。"""
         try:
-            ext = str(file_path).lower()
-            if ext.endswith('.csv'):
-                wb = grid_to_workbook(read_csv_grid(file_path))
-            else:
-                wb = load_workbook(file_path, data_only=True)
-        except Exception as exc:
-            warn("读取表头失败：%s" % exc)
-            return titles
-        try:
-            for ws in wb.worksheets:
-                if is_stat_sheet_name(ws.title):
-                    continue
-                try:
-                    hr = detect_header_row(ws, ws.max_row, ws.max_column)
-                except Exception:
-                    continue
-                if not hr:
-                    continue
-                for c in range(1, ws.max_column + 1):
-                    v = ws.cell(row=hr, column=c).value
-                    if v is None:
-                        continue
-                    t = cell_text(v)
-                    if t and t not in titles:
-                        titles.append(t)
-        finally:
+            wb = self._open_wb(file_path)
             try:
-                wb.close()
-            except Exception:
-                pass
+                return [s for s in wb.sheetnames if not is_stat_sheet_name(s)]
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            warn("读取工作表失败：%s" % exc)
+            return []
+
+    def _read_row_titles(self, file_path, sheet, row):
+        """读某工作表第 row 行的列名；空标题给占位，方便通用表格也能勾。"""
+        out = []
+        try:
+            wb = self._open_wb(file_path)
+            try:
+                ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
+                for c in range(1, ws.max_column + 1):
+                    v = ws.cell(row=row, column=c).value
+                    t = cell_text(v) if v is not None else ""
+                    out.append((c, t))
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            warn("读取第 %d 行表头失败：%s" % (row, exc))
+        return out
+
+    def _guess_row(self, file_path, sheet):
+        try:
+            wb = self._open_wb(file_path)
+            try:
+                ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
+                return detect_header_row(ws, ws.max_row, ws.max_column)
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception:
+            return 1
+
+    def _collect_header_titles(self, file_path, sheet=None, row=None):
+        """返回某工作表表头列名（去重保序）；sheet/row 省略时用自动识别。"""
+        sheets = self._sheet_names(file_path)
+        if not sheets:
+            return []
+        sheet = sheet or sheets[0]
+        row = row or self._guess_row(file_path, sheet)
+        titles = []
+        for _c, t in self._read_row_titles(file_path, sheet, row):
+            if t and t not in titles:
+                titles.append(t)
         return titles
-    def _split_var(self, var):
-        return [p.strip() for p in re.split(r"[，,、]+", var.get()) if p.strip()]
 
-    def _pick_columns(self, titles, need, cur, title_prefix=""):
-        """统一勾选窗口：每个表头一行，列为 金额 / 名称 / ID / 脱敏（按 need 显示）。
+    def _pick_columns(self, path, need, cur, title_prefix="", header_rows=None, sheets=None):
+        """选列窗口：可切工作表、可改表头行；每行三到四列勾选框。
 
-        need: 可含 "amount" / "cp" / "id" / "des" 的子集；cur: 同键→已选列表。
-        单击勾选；滚轮可滚动；确定返回 dict，取消返回 None。
+        返回 {"amount":[...], "cp":[...], "id":[...], "des":[...], "header_rows":{sheet:row}}
+        取消返回 None。
         """
-        if not titles:
-            messagebox.showwarning("列不出表头", "这份文件里没识别到表头行，无法列出可选的列。")
+        sheets = sheets or self._sheet_names(path)
+        if not sheets:
+            messagebox.showwarning("读不到工作表", "这个文件里没有可处理的工作表。")
             return None
+
         cols = []
         if "amount" in need:
             cols.append(("amount", "金额"))
@@ -2268,16 +2379,32 @@ class App:
             cols.append(("id", "ID"))
         if "des" in need:
             cols.append(("des", "脱敏"))
+
+        hdr_state = dict(header_rows or {})
+        sel_state = {}          # sheet -> {title: {key: bool}}
+
         win = tk.Toplevel(self.root)
-        win.title(title_prefix + "选择列（" + " / ".join(c[1] for c in cols) + "）")
-        win.geometry("600x560")
+        win.title(title_prefix + "选择列")
+        win.geometry("780x620")
         win.transient(self.root)
-        tk.Label(win, text="每个表头一行；勾上它属于哪种列（可同时勾多种）：",
-                 font=("微软雅黑", 10)).pack(anchor="w", padx=10, pady=(10, 0))
-        tk.Label(win, text="金额=交易金额列，名称=对手方名称列，ID=对手方账户ID列，脱敏=该列做脱敏；取消=本次不处理。",
-                 font=("微软雅黑", 9), fg="#666666", wraplength=560, justify="left").pack(anchor="w", padx=10, pady=(0, 6))
+
+        top = tk.Frame(win)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        tk.Label(top, text="工作表：", font=("微软雅黑", 9)).pack(side="left")
+        sheet_var = tk.StringVar(value=sheets[0])
+        sheet_box = ttk.Combobox(top, textvariable=sheet_var, values=sheets, state="readonly", width=20)
+        sheet_box.pack(side="left")
+        tk.Label(top, text="   表头在第几行：", font=("微软雅黑", 9)).pack(side="left")
+        row_var = tk.IntVar(value=0)
+        row_spin = tk.Spinbox(top, from_=1, to=10000, textvariable=row_var, width=6, font=("微软雅黑", 9))
+        row_spin.pack(side="left")
+        ref_btn = tk.Button(top, text="重新读取", font=("微软雅黑", 9))
+        ref_btn.pack(side="left", padx=8)
+        hint = tk.Label(win, text="", font=("微软雅黑", 9), fg="#666666", justify="left", anchor="w", wraplength=740)
+        hint.pack(fill="x", padx=10)
+
         holder = tk.Frame(win)
-        holder.pack(fill="both", expand=True, padx=10)
+        holder.pack(fill="both", expand=True, padx=10, pady=4)
         canvas = tk.Canvas(holder, borderwidth=0, highlightthickness=0, bg="white")
         sb = tk.Scrollbar(holder, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg="white")
@@ -2286,18 +2413,65 @@ class App:
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        tk.Label(inner, text="表头", bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=2)
-        for i, (key, label) in enumerate(cols, start=1):
-            tk.Label(inner, text=label, bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=i, padx=8)
-        state = {}
-        for r, t in enumerate(titles, start=1):
-            tk.Label(inner, text=t, bg="white", font=("微软雅黑", 9), anchor="w", justify="left").grid(row=r, column=0, sticky="w", padx=6)
-            per = {}
+
+        def _on_wheel(event, _c=canvas):
+            try:
+                _c.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+
+        win.bind("<MouseWheel>", _on_wheel)
+
+        current = {"sheet": sheets[0], "state": {}}
+
+        def build():
+            """按当前工作表与行号重建勾选框。"""
+            for w in list(inner.children.values()):
+                w.destroy()
+            sheet = sheet_var.get()
+            row = max(1, int(row_var.get() or 1))
+            hdr_state[sheet] = row
+            titles = self._read_row_titles(path, sheet, row)
+            prev = sel_state.setdefault(sheet, {})
+            tk.Label(inner, text="表头", bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=2)
             for i, (key, label) in enumerate(cols, start=1):
-                v = tk.BooleanVar(value=(t in (cur.get(key) or [])))
-                tk.Checkbutton(inner, variable=v, bg="white", activebackground="white").grid(row=r, column=i, padx=8)
-                per[key] = v
-            state[t] = per
+                tk.Label(inner, text=label, bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=i, padx=8)
+            st = {}
+            r = 1
+            for idx, t in titles:
+                label = t if t else "（第 %d 列，无标题）" % idx
+                tk.Label(inner, text=label, bg="white", font=("微软雅黑", 9), anchor="w",
+                         justify="left").grid(row=r, column=0, sticky="w", padx=6)
+                per = {}
+                for i, (key, _lab) in enumerate(cols, start=1):
+                    var = tk.BooleanVar(value=bool(prev.get(t, {}).get(key)) if t and key in need else False)
+                    cb = tk.Checkbutton(inner, variable=var, bg="white", activebackground="white",
+                                        state=("normal" if t else "disabled"))
+                    cb.grid(row=r, column=i, padx=8)
+                    per[key] = var
+                if t:
+                    st[t] = per
+                r += 1
+            current["state"] = st
+            filled = sum(1 for _i, t in titles if t)
+            hint.config(text="本表共 %d 行表头列（有文字的 %d 个）。如果上面的不是真正的表头，改「表头在第几行」再点重新读取。" % (len(titles), filled))
+
+        def refresh(*_a):
+            # 保存当前勾选，再按新行号重建
+            sheet = current.get("sheet")
+            if sheet and current.get("state"):
+                sel_state[sheet] = {t: {k: v.get() for k, v in per.items()} for t, per in current["state"].items()}
+            current["sheet"] = sheet_var.get()
+            row_var.set(hdr_state.get(current["sheet"]) or self._guess_row(path, current["sheet"]))
+            build()
+
+        def on_sheet_change(*_a):
+            refresh()
+
+        ref_btn.config(command=refresh)
+        sheet_box.bind("<<ComboboxSelected>>", on_sheet_change)
+        row_spin.bind("<Return>", lambda e: refresh())
+
         result = {"ok": False}
 
         def _ok():
@@ -2309,26 +2483,26 @@ class App:
         tk.Button(btns, text="确定", width=10, command=_ok).pack(side=tk.LEFT, padx=6)
         tk.Button(btns, text="取消", width=10, command=win.destroy).pack(side=tk.LEFT, padx=6)
 
-        def _on_wheel(event, _c=canvas):
-            try:
-                _c.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            except Exception:
-                pass
-
-        win.bind("<MouseWheel>", _on_wheel)
+        row_var.set(hdr_state.get(sheets[0]) or self._guess_row(path, sheets[0]))
+        build()
         win.grab_set()
         win.lift()
         win.focus_force()
         self.root.wait_window(win)
         if not result["ok"]:
             return None
-        out = {}
-        for key, _label in cols:
-            out[key] = [t for t in titles if state[t][key].get()]
-        for key in ("amount", "cp", "id", "des"):
-            out.setdefault(key, [])
-        return out
 
+        # 合并各工作表勾选结果
+        sel_state[current["sheet"]] = {t: {k: v.get() for k, v in per.items()}
+                                       for t, per in current["state"].items()}
+        out = {k: [] for k in ("amount", "cp", "id", "des")}
+        for sheet, per_title in sel_state.items():
+            for title, flags in per_title.items():
+                for key, on in flags.items():
+                    if on and title not in out[key]:
+                        out[key].append(title)
+        out["header_rows"] = dict(hdr_state)
+        return out
 
     def select_files(self):
         if self.processing:
@@ -2372,7 +2546,7 @@ class App:
                     "id": self._split_var(self.user_counterparty_id_titles),
                     "des": self._split_var(self.desensitize_titles),
                 }
-                picked = self._pick_columns(self._collect_header_titles(rep), need, cur, title_prefix=prefix)
+                picked = self._pick_columns(rep, need, cur, title_prefix=prefix)
                 if picked is None:
                     messagebox.showinfo("已取消", "没有确认要用的列，本次不处理任何文件。")
                     return
@@ -2383,8 +2557,9 @@ class App:
                 if need_des and not des:
                     if not messagebox.askyesno("一列都没选", "没有勾选任何脱敏列，继续处理等于「不做脱敏」。\\n确定要继续吗？"):
                         return
+                hr_map = picked.get("header_rows") or {}
                 for fp in files:
-                    overrides[_norm_key(fp)] = (list(amt), list(cp), list(cid), list(des))
+                    overrides[_norm_key(fp)] = (list(amt), list(cp), list(cid), list(des), dict(hr_map))
                 if first_group:
                     self.user_amount_titles.set("，".join(amt))
                     self.user_counterparty_titles.set("，".join(cp))
