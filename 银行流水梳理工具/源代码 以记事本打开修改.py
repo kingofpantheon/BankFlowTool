@@ -1733,6 +1733,74 @@ def write_stat_block(ws, start_row, title, name_stats, name_id_stats, totals=Non
     return current_row
 
 
+
+def _sheet_segments(ws, max_col):
+    """按整行空白把工作表切成若干段，返回 [(start_row, end_row), ...]。"""
+    segs, cur = [], None
+    for r in range(1, ws.max_row + 1):
+        empty = True
+        for c in range(1, max_col + 1):
+            v = ws.cell(r, c).value
+            if v is not None and not (isinstance(v, str) and not v.strip()):
+                empty = False
+                break
+        if empty:
+            if cur:
+                segs.append(cur)
+                cur = None
+        else:
+            cur = (cur[0], r) if cur else (r, r)
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def _segment_header_row(ws, start, end, max_col):
+    """在一段内找表头行：先银行关键词，再通用短文本规则；取前 3 行里最像的。"""
+    best_row, best_score = start, -1
+    for row in range(start, min(end, start + 3) + 1):
+        kw = _header_score(ws, row, min(max_col, 120))
+        gen = _generic_header_score(ws, row, min(max_col, 120))
+        score = kw * 10 + gen
+        if score > best_score:
+            best_row, best_score = row, score
+    return best_row
+
+
+def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
+    """按列标题在整张表逐段脱敏：每段用自己那一行表头，互不影响。
+
+    这样一张表里堆了多张不同表头的表也能各自命中。
+    """
+    total = 0
+    wanted = set(t.strip() for t in (wanted_titles or []) if t and t.strip())
+    if not wanted:
+        return total
+    segs = _sheet_segments(ws, ws.max_column)
+    if not segs:
+        segs = [(fallback_header or 1, ws.max_row)]
+    for (s, e) in segs:
+        hdr = _segment_header_row(ws, s, e, ws.max_column)
+        if not (s <= hdr <= e):
+            hdr = s
+        for col in range(1, ws.max_column + 1):
+            title = cell_text(ws.cell(row=hdr, column=col).value).strip()
+            if not title or title not in wanted:
+                continue
+            for r in range(hdr + 1, e + 1):
+                cell = ws.cell(row=r, column=col)
+                v = cell.value
+                if v is None:
+                    continue
+                if isinstance(v, str) and not v.strip():
+                    continue
+                if _mask_already(v):
+                    continue
+                cell.value = desensitize_mapper.mask(v)
+                total += 1
+    return total
+
+
 def _mask_already(value):
     """单元格是不是已经被本轮的脱敏表替换过（防止二次脱敏）。"""
     try:
@@ -1770,7 +1838,8 @@ def _mask_columns_whole(ws, header_row, cols):
 
 def process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stats, collect_data,
                            manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                           enable_desensitize, desensitize_cols, enable_money_clean, header_row=None):
+                           enable_desensitize, desensitize_cols, enable_money_clean, header_row=None,
+                           desensitize_titles=None):
     max_row = ws.max_row
     max_col = ws.max_column
     log(f"工作表「{sheet_name}」开始处理（{max_row} 行 × {max_col} 列）")
@@ -1784,8 +1853,11 @@ def process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stat
         header_row = detect_header_row(ws, max_row, max_col)
 
     # 脱敏独立于流水区块：整列脱敏先做，通用表格也能用
-    if enable_desensitize and desensitize_cols:
-        _n_masked = _mask_columns_whole(ws, header_row, desensitize_cols)
+    if enable_desensitize and (desensitize_titles or desensitize_cols):
+        if desensitize_titles:
+            _n_masked = _mask_sheet_columns(ws, desensitize_titles, header_row)
+        else:
+            _n_masked = _mask_columns_whole(ws, header_row, desensitize_cols)
         if _n_masked:
             log(f"脱敏：工作表「{sheet_name}」共处理 {_n_masked} 个单元格")
     # 表头都没识别出来，说明这张表多半不是流水表：细节只写日志，不刷屏
@@ -1919,7 +1991,8 @@ def process_csv(file_path, enable_sum, enable_internal_stats, collect_data,
                                                 enable_desensitize, desensitize_titles)
     data = process_worksheet_multi(ws, wb, "Sheet1", enable_sum, enable_internal_stats, collect_data,
                                    manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                                   enable_desensitize, desensitize_cols, enable_money_clean, header_row)
+                                   enable_desensitize, desensitize_cols, enable_money_clean, header_row,
+                                   desensitize_titles=desensitize_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
     wb.save(output_path)
     return output_path, data
@@ -1940,7 +2013,8 @@ def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
                                                 enable_desensitize, desensitize_titles)
     data = process_worksheet_multi(ws, wb, "Sheet1", enable_sum, enable_internal_stats, collect_data,
                                    manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                                   enable_desensitize, desensitize_cols, enable_money_clean, header_row)
+                                   enable_desensitize, desensitize_cols, enable_money_clean, header_row,
+                                   desensitize_titles=desensitize_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
     wb.save(output_path)
     return output_path, data
@@ -1969,7 +2043,8 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
                         warn(f"工作表「{sheet_name}」未找到脱敏列标题 '{title}'，跳过该列")
             data = process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stats, collect_data,
                                            manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                                           enable_desensitize, desensitize_cols, enable_money_clean, header_row)
+                                           enable_desensitize, desensitize_cols, enable_money_clean, header_row,
+                                           desensitize_titles=desensitize_titles)
             all_data.extend(data)
         except Exception as e:
             # 单个工作表出错不再拖垮整批文件
@@ -2346,6 +2421,32 @@ class App:
         except Exception:
             return 1
 
+
+    def _extra_segment_titles(self, path, sheet, current_row):
+        """本表里其它"表头段"的列名，标注段号，避免多表堆积时漏选。"""
+        out = []
+        try:
+            wb = self._open_wb(path)
+            try:
+                ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
+                segs = _sheet_segments(ws, ws.max_column)
+                for i, (s, e) in enumerate(segs, start=1):
+                    hdr = _segment_header_row(ws, s, e, ws.max_column)
+                    if hdr == current_row:
+                        continue
+                    for c in range(1, ws.max_column + 1):
+                        title = cell_text(ws.cell(row=hdr, column=c).value).strip()
+                        if title:
+                            out.append((title, i))
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return out
+
     def _collect_header_titles(self, file_path, sheet=None, row=None):
         """返回某工作表表头列名（去重保序）；sheet/row 省略时用自动识别。"""
         sheets = self._sheet_names(file_path)
@@ -2451,6 +2552,23 @@ class App:
                     per[key] = var
                 if t:
                     st[t] = per
+                r += 1
+            # 其它分段的表头也列出来（多表堆在一张表里时更不容易漏）
+            seen = {t for _i, t in titles if t}
+            for title, seg_no in self._extra_segment_titles(path, sheet, row):
+                if title in seen:
+                    continue
+                seen.add(title)
+                tk.Label(inner, text="%s  ｜第 %d 段" % (title, seg_no), bg="white",
+                         font=("微软雅黑", 9), anchor="w", justify="left",
+                         fg="#555555").grid(row=r, column=0, sticky="w", padx=6)
+                per = {}
+                for i, (key, _lab) in enumerate(cols, start=1):
+                    var = tk.BooleanVar(value=bool(prev.get(title, {}).get(key)))
+                    tk.Checkbutton(inner, variable=var, bg="white",
+                                   activebackground="white").grid(row=r, column=i, padx=8)
+                    per[key] = var
+                st[title] = per
                 r += 1
             current["state"] = st
             filled = sum(1 for _i, t in titles if t)
