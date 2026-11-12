@@ -1801,6 +1801,15 @@ def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
     return total
 
 
+def _parse_row_input(text, fallback=1):
+    """把"表头在第几行"输入框的文本解析成行号；解析不了就用 fallback。"""
+    try:
+        v = int(float(str(text).strip()))
+    except Exception:
+        return fallback
+    return v if v >= 1 else fallback
+
+
 def _mask_already(value):
     """单元格是不是已经被本轮的脱敏表替换过（防止二次脱敏）。"""
     try:
@@ -2611,11 +2620,29 @@ class App:
             filled = sum(1 for _i, t in titles if t)
             hint.config(text="本表共 %d 行表头列（有文字的 %d 个）。如果上面的不是真正的表头，改「表头在第几行」再点重新读取。" % (len(titles), filled))
 
-        def refresh(*_a):
-            # 保存当前勾选，再按新行号重建
+        def _save_current():
             sheet = current.get("sheet")
             if sheet and current.get("state"):
-                sel_state[sheet] = {t: {k: v.get() for k, v in per.items()} for t, per in current["state"].items()}
+                sel_state[sheet] = {t: {k: v.get() for k, v in per.items()}
+                                    for t, per in current["state"].items()}
+
+        def refresh(*_a):
+            """按输入框里写的行号重建（手改表头行后点这个 / 按回车）。"""
+            _save_current()
+            current["sheet"] = sheet_var.get()
+            try:
+                raw = str(row_spin.get()).strip()
+            except Exception:
+                raw = ""
+            typed = _parse_row_input(raw, 0)
+            if typed >= 1:
+                row_var.set(typed)
+                hdr_state[current["sheet"]] = typed
+            build()
+
+        def load_sheet(*_a):
+            """切换工作表：载入该表已定的行号，没定过就重新猜。"""
+            _save_current()
             current["sheet"] = sheet_var.get()
             row_var.set(hdr_state.get(current["sheet"]) or self._guess_row(path, current["sheet"]))
             build()
@@ -2636,7 +2663,7 @@ class App:
                                 break
                     except Exception:
                         pass
-            refresh()
+            load_sheet()
 
         ref_btn.config(command=refresh)
         sheet_box.bind("<<ComboboxSelected>>", on_sheet_change)
@@ -2645,6 +2672,12 @@ class App:
         result = {"ok": False}
 
         def _ok():
+            try:
+                typed = _parse_row_input(str(row_spin.get()).strip(), 0)
+                if typed >= 1:
+                    hdr_state[sheet_var.get()] = typed
+            except Exception:
+                pass
             result["ok"] = True
             win.destroy()
 
