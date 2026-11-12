@@ -6,7 +6,7 @@ r"""
 
 日志规则：
   * 日志就在软件（exe）同目录下，文件名带软件名和版本号，例如：
-        银行流水梳理工具 V1.7.1 运行日志.txt
+        银行流水梳理工具 V1.7.2 运行日志.txt
     双击就能打开看，不用满硬盘去找；
   * 平时永远只有这一个日志文件，每次启动覆盖重写，不会越攒越多；
   * 但如果上次是闪退/被强制结束（日志里没有"正常退出"标记），
@@ -23,7 +23,7 @@ r"""
   4. 上次异常退出后，下次启动会弹窗告知，并可一键打开日志。
 
 日志位置（自动选择第一个可写的）：
-  软件(exe)所在目录\银行流水梳理工具 V1.7.1 运行日志.txt
+  软件(exe)所在目录\银行流水梳理工具 V1.7.2 运行日志.txt
   %LOCALAPPDATA%\银行流水梳理工具\logs\（同名文件）
   %APPDATA%\银行流水梳理工具\logs\（同名文件）
   %TEMP%\银行流水梳理工具_logs\（同名文件）
@@ -45,7 +45,7 @@ import faulthandler
 import threading
 import traceback
 
-VERSION = "V1.7.1"
+VERSION = "V1.7.2"
 APP_NAME = "银行流水梳理工具"
 
 # 卡死判定：主线程超过这么多秒没有心跳，就把所有线程堆栈写进日志
@@ -607,7 +607,7 @@ def export_source():
             "提示",
             "这个 exe 里没有内置源码。\n\n"
             "多半是用旧脚本或手动 PyInstaller 打的包。\n"
-            "请用工程目录里的「打包成EXE就双击我 V1.7.1.bat」重新打包，"
+            "请用工程目录里的「打包成EXE就双击我 V1.7.2.bat」重新打包，"
             "它会把源码和图标一起打进去。")
         return
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1981,25 +1981,28 @@ def resolve_desensitize_cols(ws, max_col, header_row, enable_desensitize, desens
 
 def process_csv(file_path, enable_sum, enable_internal_stats, collect_data,
                 manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None):
+                enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None,
+                desensitize_by_sheet=None):
     file_path = Path(file_path)
     rows = read_csv_grid(file_path)
     wb = grid_to_workbook(rows)
     ws = wb.active
     header_row = (header_rows or {}).get('Sheet1') or detect_header_row(ws, ws.max_row, ws.max_column)
+    _titles = (desensitize_by_sheet or {}).get("Sheet1", desensitize_titles)
     desensitize_cols = resolve_desensitize_cols(ws, ws.max_column, header_row,
-                                                enable_desensitize, desensitize_titles)
+                                                enable_desensitize, _titles)
     data = process_worksheet_multi(ws, wb, "Sheet1", enable_sum, enable_internal_stats, collect_data,
                                    manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
                                    enable_desensitize, desensitize_cols, enable_money_clean, header_row,
-                                   desensitize_titles=desensitize_titles)
+                                   desensitize_titles=_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
     wb.save(output_path)
     return output_path, data
 
 def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
                     manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                    enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None):
+                    enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None,
+                    desensitize_by_sheet=None):
     file_path = Path(file_path)
     try:
         df = pd.read_excel(file_path, header=None, dtype=str, engine='xlrd')
@@ -2009,19 +2012,21 @@ def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
     wb = grid_to_workbook(df.values.tolist())
     ws = wb.active
     header_row = (header_rows or {}).get('Sheet1') or detect_header_row(ws, ws.max_row, ws.max_column)
+    _titles = (desensitize_by_sheet or {}).get("Sheet1", desensitize_titles)
     desensitize_cols = resolve_desensitize_cols(ws, ws.max_column, header_row,
-                                                enable_desensitize, desensitize_titles)
+                                                enable_desensitize, _titles)
     data = process_worksheet_multi(ws, wb, "Sheet1", enable_sum, enable_internal_stats, collect_data,
                                    manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
                                    enable_desensitize, desensitize_cols, enable_money_clean, header_row,
-                                   desensitize_titles=desensitize_titles)
+                                   desensitize_titles=_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
     wb.save(output_path)
     return output_path, data
 
 def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
                  manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
-                 enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None):
+                 enable_desensitize, desensitize_titles, enable_money_clean, header_rows=None,
+                 desensitize_by_sheet=None):
     file_path = Path(file_path)
     wb = load_workbook(file_path, data_only=True)
     all_data = []
@@ -2033,9 +2038,13 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
         ws = wb[sheet_name]
         try:
             header_row = (header_rows or {}).get(sheet_name) or detect_header_row(ws, ws.max_row, ws.max_column)
+            if desensitize_by_sheet is not None:
+                sheet_titles = desensitize_by_sheet.get(sheet_name, [])
+            else:
+                sheet_titles = desensitize_titles
             desensitize_cols = []
-            if enable_desensitize and desensitize_titles:
-                for title in desensitize_titles:
+            if enable_desensitize and sheet_titles:
+                for title in sheet_titles:
                     col = find_column_by_title(ws, ws.max_column, header_row, [title])
                     if col is not None:
                         desensitize_cols.append(col)
@@ -2044,7 +2053,7 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
             data = process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stats, collect_data,
                                            manual_mode, user_amount_titles, user_counterparty_titles, user_counterparty_id_titles,
                                            enable_desensitize, desensitize_cols, enable_money_clean, header_row,
-                                           desensitize_titles=desensitize_titles)
+                                           desensitize_titles=sheet_titles)
             all_data.extend(data)
         except Exception as e:
             # 单个工作表出错不再拖垮整批文件
@@ -2080,11 +2089,14 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
             log(f"处理文件 {idx+1}/{total}: {file_path.name}")
             progress_callback(idx + 1, total, file_path.name)
             _hr = None
+            _dbs = None
             if overrides and _norm_key(file_path) in overrides:
                 _ov = overrides[_norm_key(file_path)]
                 _amt, _cp, _cid, _des = _ov[0], _ov[1], _ov[2], _ov[3]
                 if len(_ov) >= 5:
                     _hr = _ov[4]
+                if len(_ov) >= 6:
+                    _dbs = _ov[5]
             else:
                 _amt, _cp, _cid, _des = (user_amount_titles, user_counterparty_titles, user_counterparty_id_titles, desensitize_titles)
             _t_file = time.time()
@@ -2093,15 +2105,18 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
                 if ext == '.csv':
                     out_path, data = process_csv(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
                                                  manual_mode, _amt, _cp, _cid,
-                                                 enable_desensitize, _des, enable_money_clean, header_rows=_hr)
+                                                 enable_desensitize, _des, enable_money_clean, header_rows=_hr,
+                                                 desensitize_by_sheet=_dbs)
                 elif ext == '.xls':
                     out_path, data = process_old_xls(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
                                                      manual_mode, _amt, _cp, _cid,
-                                                     enable_desensitize, _des, enable_money_clean, header_rows=_hr)
+                                                     enable_desensitize, _des, enable_money_clean, header_rows=_hr,
+                                                     desensitize_by_sheet=_dbs)
                 elif ext == '.xlsx':
                     out_path, data = process_xlsx(file_path, enable_sum, enable_internal_stats, enable_cross_summary,
                                                   manual_mode, _amt, _cp, _cid,
-                                                  enable_desensitize, _des, enable_money_clean, header_rows=_hr)
+                                                  enable_desensitize, _des, enable_money_clean, header_rows=_hr,
+                                                  desensitize_by_sheet=_dbs)
                 else:
                     raise Exception(f"不支持的文件类型：{ext}")
             except Exception as e:
@@ -2274,7 +2289,7 @@ class App:
                                  "【导出运行日志】\n当遇到异常时，可点击“导出运行日志”按钮，将详细运行信息导出供分析。\n\n"
                                  "【处理完成提示】\n如果某个工作表没有生成统计汇总表（例如对手方名称列整列为空、"
                                  "金额列识别不到），完成提示框里会列出具体原因，可据此勾选“手动指定列”重跑。")
-        info_text.insert(tk.END, "\n\n【自动运行日志】\n本软件一启动，就会在本软件同目录下写一个日志文件（文件名带版本号，如「银行流水梳理工具 V1.7.1 运行日志.txt」）；保留最近 5 次（当前 + _历史1~4），每次启动自动轮转；上次若是闪退，会自动把上次的末尾留在新日志开头，证据不会丢。遇到卡死或闪退，点“日志存到桌面”，把桌面上那个 txt 发回即可。\n")
+        info_text.insert(tk.END, "\n\n【自动运行日志】\n本软件一启动，就会在本软件同目录下写一个日志文件（文件名带版本号，如「银行流水梳理工具 V1.7.2 运行日志.txt」）；保留最近 5 次（当前 + _历史1~4），每次启动自动轮转；上次若是闪退，会自动把上次的末尾留在新日志开头，证据不会丢。遇到卡死或闪退，点“日志存到桌面”，把桌面上那个 txt 发回即可。\n")
         info_text.insert(tk.END, "\n\n【源码备份】\n打包时源码和图标已经一并打进了 exe。点“导出源码备份”，桌面会多出一个文件夹，里面是当前版本的完整源码（.py）和图标（.ico）——换电脑、重装系统都不会再丢。万一界面打不开，还可以在命令行执行：程序.exe --export-source\n")
         info_text.tag_config("red_bold", foreground="red", font=("微软雅黑", 9, "bold"))
         info_text.config(state=tk.DISABLED)
@@ -2460,6 +2475,16 @@ class App:
                 titles.append(t)
         return titles
 
+    def _sheet_signature(self, path, sheet, row):
+        """工作表表头签名：把该表（含其它分段）的列名排序后拼起来，用于判断"表头是否一样"。"""
+        try:
+            titles = {t for _c, t in self._read_row_titles(path, sheet, row) if t}
+            for title, _seg in self._extra_segment_titles(path, sheet, row):
+                titles.add(title)
+            return tuple(sorted(titles))
+        except Exception:
+            return ()
+
     def _split_var(self, var):
         """把「a，b、c」这种多值输入拆成列表。"""
         try:
@@ -2507,6 +2532,10 @@ class App:
         row_var = tk.IntVar(value=0)
         row_spin = tk.Spinbox(top, from_=1, to=10000, textvariable=row_var, width=6, font=("微软雅黑", 9))
         row_spin.pack(side="left")
+        share_var = tk.BooleanVar(value=True)
+        share_cb = tk.Checkbutton(top, text="表头相同的工作表沿用同一套勾选", variable=share_var,
+                                  font=("微软雅黑", 9), bg="#f0f0f0")
+        share_cb.pack(side="left", padx=10)
         ref_btn = tk.Button(top, text="重新读取", font=("微软雅黑", 9))
         ref_btn.pack(side="left", padx=8)
         hint = tk.Label(win, text="", font=("微软雅黑", 9), fg="#666666", justify="left", anchor="w", wraplength=740)
@@ -2592,6 +2621,21 @@ class App:
             build()
 
         def on_sheet_change(*_a):
+            # 勾了"复用"时：切到签名相同的工作表，直接继承已配置的那一套
+            if share_var.get():
+                new_sheet = sheet_var.get()
+                if new_sheet not in sel_state:
+                    try:
+                        new_row = hdr_state.get(new_sheet) or self._guess_row(path, new_sheet)
+                        sig = self._sheet_signature(path, new_sheet, new_row)
+                        for other, rows in hdr_state.items():
+                            if other == new_sheet or other not in sel_state:
+                                continue
+                            if self._sheet_signature(path, other, rows) == sig and sig:
+                                sel_state[new_sheet] = {k: dict(v) for k, v in sel_state[other].items()}
+                                break
+                    except Exception:
+                        pass
             refresh()
 
         ref_btn.config(command=refresh)
@@ -2628,6 +2672,31 @@ class App:
                     if on and title not in out[key]:
                         out[key].append(title)
         out["header_rows"] = dict(hdr_state)
+        # 每个工作表各自一套；勾了复用的，签名相同的表并入同一套
+        by_sheet = {}
+        for sheet, per_title in sel_state.items():
+            by_sheet[sheet] = [title for title, flags in per_title.items()
+                               if any(flags.get(k) for k in ("amount", "cp", "id", "des")) and
+                               flags.get("des")]
+        if share_var.get():
+            for sheet in sheets:
+                if sheet in by_sheet:
+                    continue
+                try:
+                    row = hdr_state.get(sheet) or self._guess_row(path, sheet)
+                    sig = self._sheet_signature(path, sheet, row)
+                except Exception:
+                    continue
+                for other, titles in list(by_sheet.items()):
+                    if other == sheet:
+                        continue
+                    try:
+                        if self._sheet_signature(path, other, hdr_state.get(other) or self._guess_row(path, other)) == sig and sig:
+                            by_sheet[sheet] = list(titles)
+                            break
+                    except Exception:
+                        pass
+        out["des_by_sheet"] = by_sheet
         return out
 
     def select_files(self):
@@ -2684,8 +2753,10 @@ class App:
                     if not messagebox.askyesno("一列都没选", "没有勾选任何脱敏列，继续处理等于「不做脱敏」。\\n确定要继续吗？"):
                         return
                 hr_map = picked.get("header_rows") or {}
+                by_sheet = picked.get("des_by_sheet") or {}
                 for fp in files:
-                    overrides[_norm_key(fp)] = (list(amt), list(cp), list(cid), list(des), dict(hr_map))
+                    overrides[_norm_key(fp)] = (list(amt), list(cp), list(cid), list(des),
+                                                dict(hr_map), {k: list(v) for k, v in by_sheet.items()})
                 if first_group:
                     self.user_amount_titles.set("，".join(amt))
                     self.user_counterparty_titles.set("，".join(cp))
