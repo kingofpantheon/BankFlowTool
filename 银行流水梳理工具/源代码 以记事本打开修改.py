@@ -45,7 +45,7 @@ import faulthandler
 import threading
 import traceback
 
-VERSION = "V1.9.9"
+VERSION = "V2.0.7"
 APP_NAME = "银行流水梳理工具"
 
 # 卡死判定：主线程超过这么多秒没有心跳，就把所有线程堆栈写进日志
@@ -1059,6 +1059,7 @@ _PAD_CHAR = "\u9fa5"
 DESENS_PASSWORD = ""
 DESENS_BATCH = ""
 DESENS_PER_FILE_SALT = False
+DESENS_PUBLISH = False            # True = 脱敏发布模式（不可逆，外网随便改）
 DESENS_RANDOMIZE = False          # True = 同一值每次不同密文（带 nonce 前缀）
 DESENS_INCLUDE_HEADER = False     # True = 表头标题行也一起加密
 DESENS_COLS_MAP = {}              # {sheet_index: set(列号)} 这一轮实际加密了哪些列
@@ -1100,6 +1101,15 @@ def set_desens_rounds(n):
     except Exception:
         n = DESENS_ROUNDS_DEFAULT
     DESENS_ROUNDS = max(1, min(999, n))
+
+
+def set_desens_publish(flag):
+    """True = 脱敏发布：单向假名化，不可还原、不签名、随便改。
+
+    False = 加密保管：可逆、要口令、改过会报警。
+    """
+    global DESENS_PUBLISH
+    DESENS_PUBLISH = bool(flag)
 
 
 def set_desens_randomize(flag):
@@ -1256,14 +1266,17 @@ def _scrub_metadata(wb, masked_gen=0, keyfp="", salt="", hint="", src="", batch=
                         _cols_str = ""
             except Exception:
                 _cols_str = ""
+            _mode = mode or ("publish" if DESENS_PUBLISH else ("rnd" if DESENS_RANDOMIZE else "det"))
+            _pub = (_mode == "publish")
             p.keywords = ("BFT_MASK_GEN=%d;SALT=%s;KEYFP=%s;HINT=%s;SRC=%s;BATCH=%s;"
-                          "MODE=%s;ROUNDS=%d;HDR=%d;COLS=%s;ALGO=fpe-v1") % (
+                          "MODE=%s;ROUNDS=%d;HDR=%d;COLS=%s;ALGO=%s") % (
                 masked_gen, salt or "-", keyfp or "-",
                 _b64(hint)[:80] or "-", _b64(src)[:80] or "-", batch or "-",
-                mode or ("rnd" if DESENS_RANDOMIZE else "det"),
-                rounds or DESENS_ROUNDS,
+                _mode,
+                0 if _pub else (rounds or DESENS_ROUNDS),
                 1 if DESENS_INCLUDE_HEADER else 0,
-                _cols_str or "-")
+                _cols_str or "-",
+                "alias-v1" if _pub else "fpe-v1")
             # 完整性印记单独放 description：keywords 已经很长，再塞 64 位会超字段长度
             p.description = ("BFTSIG=%s" % sig) if sig else None
         else:
@@ -1357,6 +1370,7 @@ class DesensitizeMapper:
         self.legacy_to_orig = {}
         self.manifest = {}
         self.randomized = False
+        self.publish = False
         self.password = None
         self.keyfp = ""
         self._k_fpe = self._k_mac = self._k_wrap = b""
@@ -1417,7 +1431,34 @@ class DesensitizeMapper:
         return "".join(out)
 
     # --- 对外
+    def _alias(self, s):
+        """单向假名：同值同结果，但没有密钥算不回去。
+
+        发布模式专用。前缀按值的字符类型给，方便肉眼分辨是哪类数据。
+        """
+        key = self._k_mac or self.salt
+        h = hmac.new(key, s.encode("utf-8"), hashlib.sha256).digest()
+        code = base64.b32encode(h).decode("ascii").rstrip("=")[:6]
+        c0 = s[:1]
+        if "\u4e00" <= c0 <= "\u9fff":
+            pre = "名"
+        elif c0.isdigit():
+            pre = "号"
+        elif c0.isalpha():
+            pre = "户"
+        else:
+            pre = "值"
+        return "%s-%s" % (pre, code)
+
     def mask(self, original, tweak=""):
+        if self.publish:
+            if original is None:
+                return None
+            s = str(original)
+            res = self._alias(s)
+            self.orig_to_mask.setdefault(s, res)
+            self.mask_to_orig.setdefault(res, s)
+            return res
         self._need_key()
         if original is None:
             return None
@@ -1437,6 +1478,8 @@ class DesensitizeMapper:
     def unmask(self, masked, tweak=""):
         if masked is None:
             return None
+        if getattr(self, "publish", False):
+            return masked          # 发布模式不可逆
         s = str(masked)
         if s in self.legacy_to_orig:
             return self.legacy_to_orig[s]
@@ -2474,7 +2517,7 @@ def process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stat
     # 脱敏和金额梳理已经互斥（fix_files 会把求和/统计/汇总/金额清理全关掉），
     # 所以金额列加密不会污染任何统计，勾了就该加密。
     if enable_desensitize and (desensitize_titles or desensitize_cols):
-        if not desensitize_mapper.ready:
+        if not desensitize_mapper.ready and not getattr(desensitize_mapper, "publish", False):
             warn("已勾选脱敏但没有口令，本工作表未脱敏")
         else:
             if desensitize_titles:
@@ -2626,7 +2669,11 @@ def process_csv(file_path, enable_sum, enable_internal_stats, collect_data,
                                    enable_desensitize, desensitize_cols, enable_money_clean, header_row,
                                    desensitize_titles=_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
-    if enable_desensitize and desensitize_mapper.ready:
+    if enable_desensitize and DESENS_PUBLISH:
+        # 发布模式：外网要改数据、复制副本，签名只会添乱 —— 不生成
+        _scrub_metadata(wb, 1, "-", desensitize_mapper.salt.hex(),
+                        DESENS_HINT, file_path.name, DESENS_BATCH, "publish", DESENS_ROUNDS, "")
+    elif enable_desensitize and desensitize_mapper.ready:
         _sig = _table_signature(desensitize_mapper, wb)
         _scrub_metadata(wb, 1, desensitize_mapper.keyfp, desensitize_mapper.salt.hex(),
                         DESENS_HINT, file_path.name, DESENS_BATCH, "", DESENS_ROUNDS, _sig)
@@ -2656,7 +2703,11 @@ def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
                                    enable_desensitize, desensitize_cols, enable_money_clean, header_row,
                                    desensitize_titles=_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
-    if enable_desensitize and desensitize_mapper.ready:
+    if enable_desensitize and DESENS_PUBLISH:
+        # 发布模式：外网要改数据、复制副本，签名只会添乱 —— 不生成
+        _scrub_metadata(wb, 1, "-", desensitize_mapper.salt.hex(),
+                        DESENS_HINT, file_path.name, DESENS_BATCH, "publish", DESENS_ROUNDS, "")
+    elif enable_desensitize and desensitize_mapper.ready:
         _sig = _table_signature(desensitize_mapper, wb)
         _scrub_metadata(wb, 1, desensitize_mapper.keyfp, desensitize_mapper.salt.hex(),
                         DESENS_HINT, file_path.name, DESENS_BATCH, "", DESENS_ROUNDS, _sig)
@@ -2704,7 +2755,11 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
             # 单个工作表出错不再拖垮整批文件
             warn(f"工作表「{sheet_name}」处理失败：{e}（已跳过该工作表，其余工作表继续）")
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
-    if enable_desensitize and desensitize_mapper.ready:
+    if enable_desensitize and DESENS_PUBLISH:
+        # 发布模式：外网要改数据、复制副本，签名只会添乱 —— 不生成
+        _scrub_metadata(wb, 1, "-", desensitize_mapper.salt.hex(),
+                        DESENS_HINT, file_path.name, DESENS_BATCH, "publish", DESENS_ROUNDS, "")
+    elif enable_desensitize and desensitize_mapper.ready:
         _sig = _table_signature(desensitize_mapper, wb)
         _scrub_metadata(wb, 1, desensitize_mapper.keyfp, desensitize_mapper.salt.hex(),
                         DESENS_HINT, file_path.name, DESENS_BATCH, "", DESENS_ROUNDS, _sig)
@@ -2730,10 +2785,21 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
         manual_mode = False
     # V1.8.8：给这一批文件一个共同批次号（写进每个文件属性，代替原来的金库清单）
     set_desens_batch(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-    # V1.8.0：每轮用"口令 + 本批随机盐"重建内核，映射表不再是必需物
-    desensitize_mapper = DesensitizeMapper(password=DESENS_PASSWORD)
-    if enable_desensitize and not DESENS_PASSWORD:
+    # V2.0.0：两种模式共用一套内核
+    #   发布模式：单向假名，盐口令可有可无（没有就用本批随机盐），不可还原
+    #   保管模式：可逆，必须有口令
+    if DESENS_PUBLISH:
+        desensitize_mapper = DesensitizeMapper()
+        desensitize_mapper.publish = True
+        if DESENS_PASSWORD:
+            desensitize_mapper.set_password(DESENS_PASSWORD)
+        log("脱敏方式 = 发布（单向不可逆，外网可随意修改/复制）")
+    else:
+        desensitize_mapper = DesensitizeMapper(password=DESENS_PASSWORD)
+    if enable_desensitize and not DESENS_PUBLISH and not DESENS_PASSWORD:
         warn("已勾选“启用信息脱敏”，但没有设置口令，本次不会脱敏")
+    elif enable_desensitize and DESENS_PUBLISH:
+        log("发布模式：不需要口令，也不生成完整性签名")
     elif enable_desensitize:
         log(f"脱敏内核 = {DesensitizeMapper.VERSION}，口令指纹 = {desensitize_mapper.keyfp}")
         try:
@@ -2806,6 +2872,31 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
             if enable_cross_summary:
                 all_collected.extend(data)
                 log(f"  收集到 {len(data)} 条对手方明细")
+
+        if enable_desensitize and getattr(desensitize_mapper, "publish", False):
+            # V2.0.3：发布模式产出「映射表」——代号 ↔ 真实值，留在内网。
+            # 外网只有脱敏表，反推不出代号；回内网拿这张表一换就回来。
+            _mp = getattr(desensitize_mapper, "mask_to_orig", {}) or {}
+            if _mp:
+                _ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                _stem = Path(file_paths[0]).stem if len(file_paths) == 1 else "批量%d个" % len(file_paths)
+                _map_path = Path(file_paths[0]).parent / ("密码本_%s_%s.json" % (_stem, _ts))
+                try:
+                    with open(_map_path, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "version": "alias-v1",
+                            "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "salt": desensitize_mapper.salt.hex(),
+                            "batch": DESENS_BATCH,
+                            "files": [os.path.basename(str(p)) for p in file_paths],
+                            "map": _mp,
+                        }, f, ensure_ascii=False, indent=1)
+                    mapping_path = _map_path
+                    remember_dir(_map_path)
+                    log("密码本已保存：%s（%d 条代号）" % (_map_path, len(_mp)))
+                    log("  密码本留在内网；外网弄完，用「还原脱敏」查它换回真身。")
+                except Exception as e:
+                    warn("脱敏映射表保存失败：%s" % e)
 
         if enable_desensitize and desensitize_mapper.ready:
             # V1.8.8：不再生成金库。
@@ -3173,6 +3264,117 @@ def _ask_password(mode, keyfp="", salt="", note=""):
 
 
 # ---------- 还原功能（V1.8.3：口令直解 + 提示列表 + 指纹即时校验） ----------
+_ALIAS_RE = None
+
+
+def _alias_re():
+    global _ALIAS_RE
+    if _ALIAS_RE is None:
+        # 名-ZYPPZ7 这种：1 个中文前缀 + 连字符 + 6 位 base32（A-Z 2-7）
+        _ALIAS_RE = re.compile(r"^[名号户值址]-[A-Za-z2-7]{6}$")
+    return _ALIAS_RE
+
+
+def _count_aliases(wb, limit=5):
+    """数一数工作簿里有多少个「代号」。
+
+    用途：文件可能被复制粘贴进新工作簿，MODE 标记早就没了 ——
+    这时候只能靠内容判断这是不是密码本加密过的数据。
+    """
+    pat = _alias_re()
+    n, samples = 0, []
+    try:
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                if row is None:
+                    continue
+                for v in row:
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if pat.match(s):
+                            n += 1
+                            if len(samples) < limit and s not in samples:
+                                samples.append(s)
+    except Exception:
+        pass
+    return n, samples
+
+
+def _restore_by_alias_map(file_path):
+    """发布模式专用：拿内网的映射表，把代号换回真实值。
+
+    跟"解密"不是一回事 —— 不看文件有没有被改过、被复制过，
+    只要单元格里还留着代号，就换成真实值。
+    """
+    map_path = filedialog.askopenfilename(
+        title="选内网生成的那份密码本（.json）",
+        initialdir=os.path.dirname(os.path.abspath(file_path)) or last_dir(),
+        filetypes=[("密码本", "*.json"), ("所有文件", "*.*")]
+    )
+    if not map_path:
+        messagebox.showinfo("已取消", "没有密码本就换不回真身。")
+        return
+    try:
+        with open(map_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        mp = raw.get("map") or {}
+        if not mp:
+            messagebox.showerror("密码本是空的", "这个文件里没有 map 字段。")
+            return
+    except Exception as e:
+        messagebox.showerror("读不了密码本", str(e))
+        return
+
+    try:
+        ext = Path(file_path).suffix.lower()
+        if ext == '.csv':
+            wb = grid_to_workbook(read_csv_grid(file_path))
+        elif ext == '.xls':
+            df = pd.read_excel(file_path, header=None, dtype=str, engine='xlrd')
+            df = df.astype(object).where(pd.notna(df), None)
+            wb = grid_to_workbook(df.values.tolist())
+        elif ext == '.xlsx':
+            wb = load_workbook(file_path, data_only=True)
+        else:
+            messagebox.showerror("错误", "不支持的文件格式")
+            return
+
+        # 宽容匹配：外面可能被手工改过大小写、前后多了空格
+        _mp_norm = {}
+        for k, v in mp.items():
+            _mp_norm[k.strip().upper()] = v
+
+        changed, miss = 0, set()
+        sample = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    v = cell.value
+                    if not isinstance(v, str) or not v.strip():
+                        continue
+                    key = v.strip().upper()
+                    if key in _mp_norm:
+                        if len(sample) < 5:
+                            sample.append("%s: %s -> %s" % (cell.coordinate, v, _mp_norm[key]))
+                        cell.value = _mp_norm[key]
+                        changed += 1
+                    elif _alias_re().match(key):
+                        miss.add(key)
+        out_path = Path(file_path).parent / f"{Path(file_path).stem}_换回真身.xlsx"
+        _scrub_metadata(wb, 0, "", "")
+        wb.save(out_path)
+        log(f"查表还原完成：{out_path}，替换 {changed} 个单元格，缺失代号 {len(miss)} 个")
+        tip = "换回 %d 个单元格。\n已保存至：\n%s" % (changed, out_path)
+        if sample:
+            tip += "\n\n样例：\n" + "\n".join(sample)
+        if miss:
+            tip += "\n\n有 %d 个代号在密码本里找不到（可能是外网新写的），已保持原样。" % len(miss)
+        messagebox.showinfo("完成", tip)
+    except Exception as e:
+        log_exc("映射还原失败")
+        messagebox.showerror("错误", f"还原失败：{e}")
+
+
 def restore_file():
     file_path = filedialog.askopenfilename(
         title="选择已脱敏的 Excel 或 CSV 文件（凭口令还原，不需要任何附带文件）",
@@ -3199,6 +3401,36 @@ def restore_file():
     except Exception as e:
         log(f"读取脱敏标记失败（继续尝试还原）：{e}")
     log(f"待还原文件: {file_path} | 代数={gen} 指纹={kfp or '-'} salt={'有' if salt_hex else '无'}")
+
+    # V2.0.7：判断依据改成「内容里有没有代号」。
+    # 文件被复制粘贴进新工作簿后，MODE 标记就没了，只看标记会漏判。
+    _alias_n, _alias_samples = 0, []
+    try:
+        if Path(file_path).suffix.lower() == ".xlsx":
+            _wb2 = load_workbook(file_path, read_only=True, data_only=True)
+            try:
+                _alias_n, _alias_samples = _count_aliases(_wb2)
+            finally:
+                _wb2.close()
+    except Exception:
+        pass
+
+    if _alias_n:
+        log(f"内容里检测到 {_alias_n} 个代号，例如 {_alias_samples[:3]}")
+        if messagebox.askyesno(
+                "这是密码本加密的内容",
+                "这个文件里有 %d 个代号（例如 %s）。\n\n"
+                "用密码本查表换回真身吗？\n"
+                "  是 —— 下一步选内网生成的那份密码本（.json）\n"
+                "  否 —— 按口令加密来解" % (_alias_n, "、".join(_alias_samples[:3]))):
+            return _restore_by_alias_map(file_path)
+    elif gen and globals().get("_file_mode") == "publish":
+        messagebox.showinfo(
+            "这是密码本加密的文件",
+            "文件标记显示它用密码本加密过，但内容里没扫到代号。\n"
+            "可能代号已经被替换或删掉了。\n\n"
+            "接下来仍然可以选密码本试试查表。")
+        return _restore_by_alias_map(file_path)
 
     if gen >= 2:
         warn("这个文件是第 %d 代脱敏（历史遗留的多代叠加），只能恢复出第 %d 代的值，"
@@ -3354,17 +3586,11 @@ class App:
         info_text.insert(tk.END, "银行拉取的流水文件中，金额单元格常包含不可见格式（如货币符号、千分位、空格等），"
                                  "导致Excel公式无法正常求和。本软件可自动识别金额列，清理不可见字符，并转换为数值，"
                                  "确保统计准确。同时可生成对手方流水统计表（含流入/流出/合计）以及按对手方账户ID的细分统计。\n\n"
-                                 "【信息脱敏】\n独立功能，不能和上面的金额梳理类选项同时使用。"
-                                 "可对指定列做确定性加密（数字→数字、中文→中文、英文→英文，长度不变），"
-                                 "密钥由口令派生，凭口令即可还原；金额列也可以一起勾。\n"
-                                 "  同一次处理共用一把盐：同一批文件里，同一个对手方密文相同，可以互相对照、拼表；\n"
-                                 "  换一次处理就换一把盐，跨批次的密文对不上（故意的，防止跨批拼数据）。\n"
-                                 "  需要「一份文件一把盐」的，在勾选表头的那个窗口里勾上对应选项。\n"
-                                 "  想要「同一个值每次密文都不同」（抗频率分析，但放弃分组聚类），\n"
-                                 "  同一个窗口里勾「随机化加密」——密文会多出 2 个字符的前缀，长度 +2。\n"
-                                 "  同一个窗口里还能填「加密轮数」（默认 12），轮数越多越慢越难反推。\n\n"
-                                 "【还原脱敏】\n选脱敏后的文件，输入当时的口令即可还原。不需要附带任何文件——\n"
-                                 "别人拿到加密文件，用同款软件输同一个口令也能解。\n\n"
+                                 "【信息脱敏】\n只处理勾选的列，没勾的原样保留。\n"
+                                 "  口令加密：整表加密，凭口令还原；文件被编辑过就解不开。\n"
+                                 "  密码本加密：关键信息换成代号（名-7K3MQP），不要口令；\n"
+                                 "              外网随便改，回内网用密码本查表换回真身。\n\n"
+                                 "【还原脱敏】\n口令加密 → 输口令；密码本加密 → 选密码本查表。\n\n"
                                  "【导出运行日志】\n当遇到异常时，可点击“导出运行日志”按钮，将详细运行信息导出供分析。")
         info_text.tag_config("red_bold", foreground="red", font=("微软雅黑", 9, "bold"))
         info_text.config(state=tk.DISABLED)
@@ -3417,6 +3643,17 @@ class App:
             font=("微软雅黑", 10), command=self._on_desensitize_toggle)
         self.cb_desensitize.pack(anchor="w")
 
+        self.mode_publish = BooleanVar(value=False)
+        mode_row = tk.Frame(self.desensitize_frame, bg="#f0f0f0")
+        mode_row.pack(anchor="w", padx=(18, 0))
+        tk.Radiobutton(mode_row, text="口令加密：凭口令还原", variable=self.mode_publish,
+                       value=False, bg="#f0f0f0", font=("微软雅黑", 9),
+                       command=self._sync_exclusive).pack(side="left")
+        tk.Radiobutton(mode_row, text="密码本加密：关键信息换代号，回内网查表还原",
+                       variable=self.mode_publish, value=True, bg="#f0f0f0",
+                       font=("微软雅黑", 9),
+                       command=self._sync_exclusive).pack(side="left", padx=(12, 0))
+
         self.desensitize_pick = Label(self.desensitize_frame, text="", bg="#f0f0f0", font=("微软雅黑", 9),
                                       fg="#006400", wraplength=620, justify="left")
         self.desensitize_pick.pack_forget()
@@ -3428,10 +3665,10 @@ class App:
         self.btn = tk.Button(btn_frame, text="选择文件（可多选）", command=self.select_files, font=("微软雅黑", 10))
         self.btn.pack()
 
-        restore_btn = Button(btn_frame, text="还原脱敏（选文件 → 输口令）", command=restore_file, font=("微软雅黑", 10), bg="#e0e0e0")
+        restore_btn = Button(btn_frame, text="还原脱敏（口令加密 / 密码本加密，自动判断）", command=restore_file, font=("微软雅黑", 10), bg="#e0e0e0")
         restore_btn.pack(pady=5)
 
-        restore_hint = tk.Label(btn_frame, text="还原操作：选脱敏后的文件 → 输入当时的口令。不再需要金库/映射文件，换电脑、发给别人都一样",
+        restore_hint = tk.Label(btn_frame, text="口令加密的输口令；密码本加密的选密码本查表换回真身（外网改过、复制过都不影响）",
                                 bg="#f0f0f0", font=("微软雅黑", 8), fg="gray")
         restore_hint.pack(pady=2)
 
@@ -3861,8 +4098,13 @@ class App:
 
         rnd_bar = tk.Frame(win)
         rnd_bar.pack(pady=(1, 0))
+        _is_pub = bool(self.mode_publish.get())
         Checkbutton(rnd_bar, text="随机化加密（同一个值每次密文都不同，抗频率分析；代价：同一对手方不再聚成一组）",
-                    variable=self.randomize_mode, font=("微软雅黑", 9)).pack(side="left")
+                    variable=self.randomize_mode, font=("微软雅黑", 9),
+                    state=("disabled" if _is_pub else "normal")).pack(side="left")
+        if _is_pub:
+            tk.Label(rnd_bar, text="（发布模式用不上：假名本来就是单向的）", font=("微软雅黑", 8),
+                     fg="#888888").pack(side="left", padx=6)
 
         hdr_bar = tk.Frame(win)
         hdr_bar.pack(pady=(1, 0))
@@ -3873,7 +4115,8 @@ class App:
         rnd_row.pack(pady=(1, 0))
         tk.Label(rnd_row, text="加密轮数", font=("微软雅黑", 9)).pack(side="left")
         tk.Spinbox(rnd_row, from_=1, to=999, width=6, textvariable=self.fpe_rounds,
-                   font=("微软雅黑", 9)).pack(side="left", padx=4)
+                   font=("微软雅黑", 9),
+                   state=("disabled" if _is_pub else "normal")).pack(side="left", padx=4)
         tk.Label(rnd_row, text="轮（默认 12；爱填几轮填几轮，越高越慢越难反推，一般 12~40 够用）",
                  font=("微软雅黑", 8), fg="#888888").pack(side="left")
 
@@ -3994,13 +4237,14 @@ class App:
 
     def start_processing(self, file_paths, overrides=None):
         try:
+            set_desens_publish(self.mode_publish.get())
             set_desens_per_file_salt(self.per_file_salt.get())
             set_desens_randomize(self.randomize_mode.get())
             set_desens_rounds(self.fpe_rounds.get())
             set_desens_include_header(self.mask_header.get())
         except Exception:
             pass
-        if self.enable_desensitize.get() and not DESENS_PASSWORD:
+        if self.enable_desensitize.get() and not self.mode_publish.get() and not DESENS_PASSWORD:
             _got = _ask_password("set")
             if not _got:
                 messagebox.showinfo("已取消", "脱敏需要口令，本次不处理。")

@@ -143,7 +143,7 @@ exit /b 1
 :: ---------- 自动查找主 .py 文件 ----------
 set "MAIN_PY="
 set "PY_COUNT=0"
-:: V1.9.9：目录里同时有旧版本源码，优先打包文件名带 V1.8.0 的那个。
+:: V2.0.7：目录里同时有旧版本源码，优先打包文件名带 V1.8.0 的那个。
 :: 用纯英文通配符匹配，避免中文编码影响。
 for %%f in (源代码*.py) do if not defined MAIN_PY set "MAIN_PY=%%f"
 if defined MAIN_PY (
