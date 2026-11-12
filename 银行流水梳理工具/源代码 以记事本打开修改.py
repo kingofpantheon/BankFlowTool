@@ -6,7 +6,7 @@ r"""
 
 日志规则：
   * 日志就在软件（exe）同目录下，文件名带软件名和版本号，例如：
-        银行流水梳理工具 V1.7.2 运行日志.txt
+        银行流水梳理工具 V1.7.3 运行日志.txt
     双击就能打开看，不用满硬盘去找；
   * 平时永远只有这一个日志文件，每次启动覆盖重写，不会越攒越多；
   * 但如果上次是闪退/被强制结束（日志里没有"正常退出"标记），
@@ -23,7 +23,7 @@ r"""
   4. 上次异常退出后，下次启动会弹窗告知，并可一键打开日志。
 
 日志位置（自动选择第一个可写的）：
-  软件(exe)所在目录\银行流水梳理工具 V1.7.2 运行日志.txt
+  软件(exe)所在目录\银行流水梳理工具 V1.7.3 运行日志.txt
   %LOCALAPPDATA%\银行流水梳理工具\logs\（同名文件）
   %APPDATA%\银行流水梳理工具\logs\（同名文件）
   %TEMP%\银行流水梳理工具_logs\（同名文件）
@@ -45,7 +45,7 @@ import faulthandler
 import threading
 import traceback
 
-VERSION = "V1.7.2"
+VERSION = "V1.7.3"
 APP_NAME = "银行流水梳理工具"
 
 # 卡死判定：主线程超过这么多秒没有心跳，就把所有线程堆栈写进日志
@@ -607,7 +607,7 @@ def export_source():
             "提示",
             "这个 exe 里没有内置源码。\n\n"
             "多半是用旧脚本或手动 PyInstaller 打的包。\n"
-            "请用工程目录里的「打包成EXE就双击我 V1.7.2.bat」重新打包，"
+            "请用工程目录里的「打包成EXE就双击我 V1.7.3.bat」重新打包，"
             "它会把源码和图标一起打进去。")
         return
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1767,6 +1767,22 @@ def _segment_header_row(ws, start, end, max_col):
     return best_row
 
 
+
+def _pick_header_by_titles(ws, start, end, max_col, wanted):
+    """在某一段里挑"能匹配到最多目标列"的那一行当表头；一个都匹配不到返回 None。"""
+    best_row, best_hit = None, 0
+    last = min(end, start + 80)
+    for row in range(start, last + 1):
+        hit = 0
+        for col in range(1, max_col + 1):
+            title = cell_text(ws.cell(row=row, column=col).value).strip()
+            if title and title in wanted:
+                hit += 1
+        if hit > best_hit:
+            best_row, best_hit = row, hit
+    return best_row
+
+
 def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
     """按列标题在整张表逐段脱敏：每段用自己那一行表头，互不影响。
 
@@ -1780,7 +1796,7 @@ def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
     if not segs:
         segs = [(fallback_header or 1, ws.max_row)]
     for (s, e) in segs:
-        hdr = _segment_header_row(ws, s, e, ws.max_column)
+        hdr = _pick_header_by_titles(ws, s, e, ws.max_column, wanted) or _segment_header_row(ws, s, e, ws.max_column)
         if not (s <= hdr <= e):
             hdr = s
         for col in range(1, ws.max_column + 1):
@@ -2298,7 +2314,7 @@ class App:
                                  "【导出运行日志】\n当遇到异常时，可点击“导出运行日志”按钮，将详细运行信息导出供分析。\n\n"
                                  "【处理完成提示】\n如果某个工作表没有生成统计汇总表（例如对手方名称列整列为空、"
                                  "金额列识别不到），完成提示框里会列出具体原因，可据此勾选“手动指定列”重跑。")
-        info_text.insert(tk.END, "\n\n【自动运行日志】\n本软件一启动，就会在本软件同目录下写一个日志文件（文件名带版本号，如「银行流水梳理工具 V1.7.2 运行日志.txt」）；保留最近 5 次（当前 + _历史1~4），每次启动自动轮转；上次若是闪退，会自动把上次的末尾留在新日志开头，证据不会丢。遇到卡死或闪退，点“日志存到桌面”，把桌面上那个 txt 发回即可。\n")
+        info_text.insert(tk.END, "\n\n【自动运行日志】\n本软件一启动，就会在本软件同目录下写一个日志文件（文件名带版本号，如「银行流水梳理工具 V1.7.3 运行日志.txt」）；保留最近 5 次（当前 + _历史1~4），每次启动自动轮转；上次若是闪退，会自动把上次的末尾留在新日志开头，证据不会丢。遇到卡死或闪退，点“日志存到桌面”，把桌面上那个 txt 发回即可。\n")
         info_text.insert(tk.END, "\n\n【源码备份】\n打包时源码和图标已经一并打进了 exe。点“导出源码备份”，桌面会多出一个文件夹，里面是当前版本的完整源码（.py）和图标（.ico）——换电脑、重装系统都不会再丢。万一界面打不开，还可以在命令行执行：程序.exe --export-source\n")
         info_text.tag_config("red_bold", foreground="red", font=("微软雅黑", 9, "bold"))
         info_text.config(state=tk.DISABLED)
@@ -2712,23 +2728,18 @@ class App:
                                if any(flags.get(k) for k in ("amount", "cp", "id", "des")) and
                                flags.get("des")]
         if share_var.get():
+            # 复用 = 把勾选到的那几列用到所有工作表上；
+            # 某表里没有同名列表头时自然不会命中，不需要靠"表头签名完全一致"来拦。
+            union = []
+            for titles in by_sheet.values():
+                for x in titles:
+                    if x not in union:
+                        union.append(x)
             for sheet in sheets:
-                if sheet in by_sheet:
+                if sheet == "（无）":
                     continue
-                try:
-                    row = hdr_state.get(sheet) or self._guess_row(path, sheet)
-                    sig = self._sheet_signature(path, sheet, row)
-                except Exception:
-                    continue
-                for other, titles in list(by_sheet.items()):
-                    if other == sheet:
-                        continue
-                    try:
-                        if self._sheet_signature(path, other, hdr_state.get(other) or self._guess_row(path, other)) == sig and sig:
-                            by_sheet[sheet] = list(titles)
-                            break
-                    except Exception:
-                        pass
+                by_sheet[sheet] = list(union)
+
         out["des_by_sheet"] = by_sheet
         return out
 
