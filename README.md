@@ -52,7 +52,7 @@
 1. 进入 [Releases](../../releases) 页面，下载最新版 **`BankFlowTool_V1.7.3.exe`**
    - 直链：`https://github.com/kingofpantheon/BankFlowTool/releases/download/v1.7.3/BankFlowTool_V1.7.3.exe`
    - 说明：GitHub 会把发布资产名里的中文替换成下划线，所以资产用英文名；程序标题、界面与日志文件名仍是中文的「银行流水梳理工具」
-   - SHA256：`ED89ACAB09C0DA525D11E9CD559B9866EB8DA549FA4A71DCC9F258DCF49B78FB`
+   - SHA256：`D44BC91A4CB4CA9754277362CDE7745127C447512A4C3BDA2650B85E53A56A6F`
 2. 双击运行，GUI 界面操作，按提示选择流水文件即可
 
 ### 方式二：修改源代码（需 Python 3.8+）

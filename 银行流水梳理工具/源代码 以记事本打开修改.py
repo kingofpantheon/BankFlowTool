@@ -1247,6 +1247,17 @@ def detect_header_row(ws, max_row, max_col, max_scan_rows=80):
             return gen_row
         log(f"未识别到明显的表头行（关键词命中数 {best_score}，文本列也少于 2 个），已按第 1 行处理")
         return 1
+    if best_score < 4:
+        # 关键词证据不足（2~3 个）时不能直接采信：数据行里出现"备注/账号名称"这类词很常见，
+        # 会把它误判成表头（真实案例：表头在第 1 行，却被判成第 28 行）。
+        # 这时跟"通用规则认定的那一行"比一比：谁更像表头（短文本列更多）用谁，同分取靠上的。
+        gen_row, gen_score = _detect_generic_header_row(ws, max_row, scan_cols)
+        kw_gen = _generic_header_score(ws, best_row, scan_cols)
+        if gen_score >= 2 and (gen_score > kw_gen or (gen_score == kw_gen and gen_row < best_row)):
+            _sheet_ctx["header_score"] = best_score
+            log(f"关键词命中仅 {best_score}（第 {best_row} 行），改用更像表头的第 {gen_row} 行"
+                f"（{gen_score} 个文本列）；不对的话在选列窗口里改表头行")
+            return gen_row
     _sheet_ctx["header_score"] = best_score
     if best_score < 4:
         log(f"表头行把握不大：第 {best_row} 行（关键词命中数 {best_score}），识别结果可能有偏差")
