@@ -45,13 +45,15 @@ import faulthandler
 import threading
 import traceback
 
-VERSION = "V1.7.3"
+VERSION = "V1.9.9"
 APP_NAME = "银行流水梳理工具"
 
 # 卡死判定：主线程超过这么多秒没有心跳，就把所有线程堆栈写进日志
 HANG_WARN_SECONDS = 90
 # 正常退出时写的标记行；下次启动靠它判断上次是否正常结束
 _EXIT_SENTINEL = "===== 程序正常退出 ====="
+# V1.8.1：搬运历史时的分隔标记与"历史|"前缀剥离规则
+_CARRY_MARK = "---- 上一次运行日志末尾结束，以下是本次运行 ----"
 # 打包时会把这个文件名一起塞进 exe；软件里的“导出源码备份”就是把它写出来
 SOURCE_BACKUP_NAME = "_source_backup.py"
 ICON_BACKUP_NAME = "_icon_backup.ico"
@@ -215,6 +217,15 @@ def _copy_log_to(target):
 
 
 LOG_HISTORY_KEEP = 4   # 除当前日志外，再保留最近 4 次（合计 5 次）
+_CARRY_PREFIX_RE = None   # 真正编译放在 re 导入之后（见 _init_log_regex）
+
+
+def _init_log_regex():
+    global _CARRY_PREFIX_RE
+    try:
+        _CARRY_PREFIX_RE = re.compile(r"^(?:\s*历史\|\s*)+")
+    except Exception:
+        _CARRY_PREFIX_RE = None
 
 
 def _history_path(path, idx):
@@ -223,7 +234,14 @@ def _history_path(path, idx):
 
 
 def _rotate_logs(path):
-    """把当前日志挪成_历史1，旧的依次后移，只保留最近 LOG_HISTORY_KEEP 份历史。"""
+    """把当前日志挪成_历史1，旧的依次后移，只保留最近 LOG_HISTORY_KEEP 份历史。
+
+    V1.8.1：返回是否成功。以前整个函数包在 except: pass 里，
+    另一个实例占着日志文件时 os.replace 会失败，但循环前半段
+    （删历史4、历史3->4、历史2->3、历史1->2）已经执行完了，
+    于是"历史1"被挪走却没人补上 —— 现象就是每多开一个实例就少一份历史。
+    现在失败要回报，调用方改用自己的 PID 日志，绝不碰别人的历史。
+    """
     try:
         last = _history_path(path, LOG_HISTORY_KEEP)
         if os.path.exists(last):
@@ -234,8 +252,140 @@ def _rotate_logs(path):
                 os.replace(src, _history_path(path, i + 1))
         if os.path.exists(path):
             os.replace(path, _history_path(path, 1))
+        return True
+    except Exception:
+        return False
+
+
+_SINGLETON = {"checked": False, "second": False, "fp": None, "mutex": None}
+
+
+def _is_cmdline_only():
+    """--export-source 是"界面起不来时救源码"的只读通道：不写业务文件，也不该抢日志。"""
+    return len(sys.argv) > 1 and sys.argv[1] == "--export-source"
+
+
+def _acquire_single_instance():
+    """V1.8.2：全局单实例互斥。
+
+    用 Windows 命名互斥量（Local\\ 前缀 = 当前登录会话），进程一退出内核自动释放，
+    不会留下"死锁文件"让人误以为程序还在跑。
+    返回 True = 本进程是唯一实例；False = 已经有一个在跑。
+    拿不到句柄（非 Windows / 异常）一律返回 True：宁可多开，也不把用户挡在门外。
+    """
+    if _SINGLETON.get("mutex") is not None:
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        try:
+            kernel32.SetLastError(0)
+        except Exception:
+            pass
+        handle = kernel32.CreateMutexW(None, wintypes.BOOL(True), "Local\\BankFlowTool_single")
+        if not handle:
+            return True
+        already = (kernel32.GetLastError() == 183)   # ERROR_ALREADY_EXISTS
+        _SINGLETON["mutex"] = handle                  # 持有到进程结束，别关
+        return not already
+    except Exception:
+        return True
+
+
+def _activate_existing_window():
+    """把已经在跑的那个窗口调到前台；找不到就算了，不影响退出。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                if APP_NAME in buf.value:
+                    found.append(hwnd)
+                    return False
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        if found:
+            h = found[0]
+            if user32.IsIconic(h):
+                user32.ShowWindow(h, 9)          # SW_RESTORE
+            user32.SetForegroundWindow(h)
+            return True
     except Exception:
         pass
+    return False
+
+
+def _notify_already_running():
+    msg = (APP_NAME + " 已经在运行了。\n\n"
+           "同一时间只允许开一个窗口：两个窗口同时处理会互相覆盖输出——\n"
+           "  · xxx_已处理.xlsx 会被后来的那份覆盖；\n"
+           "  · 两份进程还会抢同一份运行日志。\n\n"
+           "请先关掉已经打开的那个窗口，再重新启动。")
+    if os.environ.get("BFT_NO_MUTEX_NOTICE"):
+        try:
+            print(msg)
+        except Exception:
+            pass
+        return
+    try:
+        import ctypes
+        # MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
+        ctypes.windll.user32.MessageBoxW(
+            None, msg, "%s %s" % (APP_NAME, VERSION), 0x40 | 0x10000 | 0x40000)
+        return
+    except Exception:
+        pass
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+
+def _i_am_second_instance():
+    """（V1.8.2 起这是兜底）万一互斥量失效、真跑出第二个实例，
+    日志就改名带 PID，至少不覆盖别人的历史。正常路径走不到这里。
+
+    用 TEMP 下一个固定名字的锁文件 + Windows 文件锁判断：
+    第一个实例锁住它并持有到进程退出；后面的实例拿不到锁就知道自己是第二个。
+    不禁止多开（有些用法就是要开两个窗口），只是各写各的日志。
+    """
+    if _SINGLETON["checked"]:
+        return _SINGLETON["second"]
+    _SINGLETON["checked"] = True
+    try:
+        import msvcrt
+        lock_dir = os.environ.get("TEMP") or os.path.expanduser("~")
+        lock_path = os.path.join(lock_dir, ".bankflow_tool.instance.lock")
+        fh = open(lock_path, "a+")
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except Exception:
+            _SINGLETON["second"] = True
+            try:
+                fh.close()
+            except Exception:
+                pass
+            return True
+        _SINGLETON["fp"] = fh      # 持有到进程结束，别关
+    except Exception:
+        pass
+    return _SINGLETON["second"]
 
 
 def _open_log_file():
@@ -246,10 +396,26 @@ def _open_log_file():
         if not d or not _try_make_dir(d):
             continue
         path = os.path.join(d, name)
-        prev_tail = _read_tail(path, CARRY_OVER_BYTES)
-        prev_clean = True if not prev_tail.strip() else (_EXIT_SENTINEL in prev_tail)
+        base, ext = os.path.splitext(name)
+        if _is_cmdline_only():
+            # 命令行导出：固定文件名、覆盖写、不轮转。
+            # 以前它会走"第二实例"分支，凭空留下一个 _PIDxxxx.txt，让人以为是垃圾文件。
+            path = os.path.join(d, "%s_命令行%s" % (base, ext))
+            prev_tail, prev_clean, second = "", True, True
+        elif _i_am_second_instance():
+            # 兜底：真跑出第二个实例时，自己的 PID 日志，不轮转、不搬运、不动别人
+            path = os.path.join(d, "%s_PID%d%s" % (base, os.getpid(), ext))
+            prev_tail, prev_clean, second = "", True, True
+        else:
+            second = False
+            prev_tail = _read_tail(path, CARRY_OVER_BYTES)
+            prev_clean = True if not prev_tail.strip() else (_EXIT_SENTINEL in prev_tail)
         try:
-            _rotate_logs(path)
+            if not second:
+                if not _rotate_logs(path):
+                    # 日志被占着（多半是另一个实例）：退回 PID 日志，历史保持原样
+                    path = os.path.join(d, "%s_PID%d%s" % (base, os.getpid(), ext))
+                    prev_tail, prev_clean = "", True
             # "w" = 每次启动覆盖重写；buffering=1 = 行缓冲，每写一行就落盘
             fp = open(path, "w", encoding="utf-8", buffering=1)
         except Exception:
@@ -683,6 +849,18 @@ def _bootstrap():
     global _start_time_text
     _start_time_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # V1.8.2：单实例互斥，必须放在建日志之前 —— 否则第二个实例会去轮转别人的日志。
+    # --export-source 是"界面起不来时救源码"的只读通道，不写任何业务文件，放行。
+    _cmdline_only = _is_cmdline_only()
+    if not _cmdline_only and not _acquire_single_instance():
+        _activate_existing_window()
+        _notify_already_running()
+        try:
+            _flush_all()
+        except Exception:
+            pass
+        sys.exit(0)
+
     ok, prev_tail, prev_clean = False, "", True
     try:
         ok, prev_tail, prev_clean = _build_handlers()
@@ -696,6 +874,7 @@ def _bootstrap():
 
     if not ok:
         return
+    _init_log_regex()
     try:
         logger.info("=" * 78)
         logger.info("%s %s 启动（本次日志已按规则清空重写）", APP_NAME, VERSION)
@@ -712,12 +891,19 @@ def _bootstrap():
             logger.warning("上一次运行没有正常结束（闪退 / 被强制结束 / 断电）。"
                            "本次日志虽然重写了，但下面先把上次的末尾原样搬过来留档，"
                            "证据不会丢：")
-            lines = [ln for ln in prev_tail.splitlines() if ln.strip()][-CARRY_OVER_LINES:]
+            # V1.8.1：只搬"上一次自己写的那段"，并且剥掉已有的"历史|"前缀，
+            # 否则每崩一次就在上一代的搬运结果上再套一层，变成"历史| 历史| 历史| ..."
+            tail = prev_tail
+            if _CARRY_MARK and _CARRY_MARK in tail:
+                tail = tail.rsplit(_CARRY_MARK, 1)[1]
+            lines = [ln for ln in tail.splitlines() if ln.strip()][-CARRY_OVER_LINES:]
+            _strip = _CARRY_PREFIX_RE.sub if _CARRY_PREFIX_RE else (lambda pat, s: s)
+            lines = [_strip('', ln) for ln in lines]
             if lines:
                 logger.warning("---- 上一次运行日志的末尾（共 %d 行，原文照搬）----", len(lines))
                 for ln in lines:
                     logger.warning("历史| %s", ln)
-                logger.warning("---- 上一次运行日志末尾结束，以下是本次运行 ----")
+                logger.warning("%s", _CARRY_MARK)
         elif prev_tail.strip():
             logger.info("上一次运行正常结束。")
         else:
@@ -746,7 +932,7 @@ try:
     from openpyxl.styles import PatternFill, Alignment, Font
     from openpyxl.utils import get_column_letter
     import tkinter as tk
-    from tkinter import messagebox, filedialog, BooleanVar, Entry, Label, Frame, Checkbutton, Button
+    from tkinter import messagebox, filedialog, simpledialog, BooleanVar, Entry, Label, Frame, Checkbutton, Button
     from tkinter import ttk
     from pathlib import Path
     import re
@@ -848,82 +1034,477 @@ def export_log():
         messagebox.showerror("错误", "保存日志失败：%s" % e)
 
 
-# ---------- 脱敏映射管理 ----------
+# ---------- 脱敏映射管理（V1.8.0：可解密的格式保留加密） ----------
+# 旧实现的三个致命缺陷：
+#   1) mask 被 process_block 与 _mask_sheet_columns 各调一次 -> 同一格脱敏两代，映射表只记一代
+#   2) "可解密"靠明文 JSON 旁路，表一丢就永久还原不了
+#   3) 种子是 md5(f"{s}_{i}")，无密钥 -> 拿到 exe 就能枚举候选明文比对出来
+# V1.8.0 做法：口令 -> PBKDF2 -> 格式保留加密(FPE)，密文同形同长，有口令才可逆。
+# 不落明文映射表；口令丢了才真还原不了（这是"可解密"的代价，已在界面提示）。
+import hmac
+import secrets
+import base64
+
+_ALPHA = {
+    "digit": list(string.digits),
+    "lower": list(string.ascii_lowercase),
+    "upper": list(string.ascii_uppercase),
+    "cjk": [chr(i) for i in range(0x4E00, 0x9FFF) if chr(i).isalpha()],
+}
+_FPE_ROUNDS = 12          # 默认值
+DESENS_ROUNDS = 12        # 实际使用（界面上可改，1~999）
+_VAULT_MAGIC = b"BFTV2"
+_PAD_CHAR = "\u9fa5"
+
+DESENS_PASSWORD = ""
+DESENS_BATCH = ""
+DESENS_PER_FILE_SALT = False
+DESENS_RANDOMIZE = False          # True = 同一值每次不同密文（带 nonce 前缀）
+DESENS_INCLUDE_HEADER = False     # True = 表头标题行也一起加密
+DESENS_COLS_MAP = {}              # {sheet_index: set(列号)} 这一轮实际加密了哪些列
+DESENS_ROUNDS_DEFAULT = 12
+
+
+def set_desens_password(pwd):
+    global DESENS_PASSWORD
+    DESENS_PASSWORD = pwd or ""
+
+
+def reset_masked_cols():
+    global DESENS_COLS_MAP
+    DESENS_COLS_MAP = {}
+
+
+def record_masked_cols(wb, sheet_name, cols):
+    """记下这个工作表里真正被加密的列号，还原时只解这些列。"""
+    try:
+        idx = wb.sheetnames.index(sheet_name)
+    except Exception:
+        return
+    if not cols:
+        return
+    DESENS_COLS_MAP.setdefault(idx, set()).update(cols)
+
+
+def set_desens_include_header(flag):
+    """True = 表头那一行也加密；False = 只加密数据行（默认）。"""
+    global DESENS_INCLUDE_HEADER
+    DESENS_INCLUDE_HEADER = bool(flag)
+
+
+def set_desens_rounds(n):
+    """加密轮数：默认 12，用户爱填几轮填几轮（1~999）。越高越慢、越难反推。"""
+    global DESENS_ROUNDS
+    try:
+        n = int(float(str(n).strip()))
+    except Exception:
+        n = DESENS_ROUNDS_DEFAULT
+    DESENS_ROUNDS = max(1, min(999, n))
+
+
+def set_desens_randomize(flag):
+    """True = 随机化加密（同值不同密文，抗频率分析）；False = 确定性（同值同密文，可聚类）。"""
+    global DESENS_RANDOMIZE
+    DESENS_RANDOMIZE = bool(flag)
+
+
+def set_desens_per_file_salt(flag):
+    """True = 一份文件一把盐（文件之间对不上）；False = 同一次处理共用一把盐。"""
+    global DESENS_PER_FILE_SALT
+    DESENS_PER_FILE_SALT = bool(flag)
+
+
+def set_desens_batch(batch_id):
+    """同一次处理的一批文件共用一个批次号，写进文件属性，替代原来的金库清单。"""
+    global DESENS_BATCH
+    DESENS_BATCH = batch_id or ""
+
+
+def _b64(s):
+    """提示里可能有 ';' '=' 之类，塞进文件属性前先编码。"""
+    try:
+        return base64.urlsafe_b64encode((s or "").encode("utf-8")).decode("ascii").rstrip("=")
+    except Exception:
+        return ""
+
+
+def _unb64(s):
+    try:
+        return base64.urlsafe_b64decode((s or "").encode("ascii") + b"=" * (-len(s or "") % 4)).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _char_class(ch):
+    if "0" <= ch <= "9":
+        return "digit"
+    if "a" <= ch <= "z":
+        return "lower"
+    if "A" <= ch <= "Z":
+        return "upper"
+    if "\u4e00" <= ch <= "\u9fff" and ch.isalpha():
+        return "cjk"
+    return None
+
+
+def _hkdf(prk, info, length=32):
+    out, t, i = b"", b"", 1
+    while len(out) < length:
+        t = hmac.new(prk, t + info + bytes([i]), hashlib.sha256).digest()
+        out += t
+        i += 1
+    return out[:length]
+
+
+def _prf_mod(k, tweak, rnd, n):
+    return int.from_bytes(
+        hmac.new(k, tweak + b"|K|" + rnd.to_bytes(4, "big"), hashlib.sha256).digest(), "big") % n
+
+
+def _prf_bit(k, tweak, rnd, lo, n):
+    msg = (tweak + b"|B|" + str(rnd).encode() + b"|" + hex(n).encode() + b"|" + hex(lo).encode())
+    return hmac.new(k, msg, hashlib.sha256).digest()[0] & 1
+
+
+def _fpe_round(k, tweak, i, x, n):
+    """一轮 swap-or-not：对合函数，加解密共用。"""
+    ki = _prf_mod(k, tweak, i, n)
+    y = (ki - x) % n
+    lo = x if x < y else y
+    return y if _prf_bit(k, tweak, i, lo, n) else x
+
+
+def _fpe_forward(k, tweak, x, n):
+    for i in range(DESENS_ROUNDS):
+        x = _fpe_round(k, tweak, i, x, n)
+    return x
+
+
+def _fpe_backward(k, tweak, x, n):
+    for i in reversed(range(DESENS_ROUNDS)):
+        x = _fpe_round(k, tweak, i, x, n)
+    return x
+
+
+def _keystream(k, nonce, length):
+    out, ctr = b"", 0
+    while len(out) < length:
+        out += hmac.new(k, b"|S|" + nonce + ctr.to_bytes(8, "big"), hashlib.sha256).digest()
+        ctr += 1
+    return out[:length]
+
+
+def _table_signature(mapper, wb):
+    """对整张工作簿的内容做 HMAC，用来发现"事后被改过"。
+
+    用无序多重集：排序、筛选、拖行都不会误报；改一个值、增删一行一定对不上。
+    """
+    try:
+        vals = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    vals.append(str(cell.value))
+        vals.sort()
+        msg = "\x1f".join(vals).encode("utf-8")
+        return hmac.new(mapper._k_mac, msg, hashlib.sha256).hexdigest()
+    except Exception:
+        return ""
+
+
+def _read_sig(wb):
+    try:
+        d = wb.properties.description or ""
+    except Exception:
+        return ""
+    m = re.search(r"BFTSIG=([0-9a-f]{64})", d)
+    return m.group(1) if m else ""
+
+
+def _scrub_metadata(wb, masked_gen=0, keyfp="", salt="", hint="", src="", batch="", mode="", rounds=0, sig=""):
+    """清掉作者/修改人/时间/custom.xml，只留一个不可逆的脱敏标记。"""
+    try:
+        p = wb.properties
+        p.creator = ""
+        p.lastModifiedBy = ""
+        p.lastPrinted = None
+        p.created = datetime.datetime(2000, 1, 1)
+        p.modified = datetime.datetime(2000, 1, 1)
+        p.title = None
+        p.subject = None
+        p.description = None
+        p.company = None
+        p.manager = None
+        p.category = None
+        if masked_gen:
+            # V1.8.3：salt 必须一起写进文件。密钥 = PBKDF2(口令, salt)，
+            # salt 不落盘的话"只凭口令还原"就是假的（口令对也解成乱码）。
+            # V1.8.4：HINT 也写进文件 —— 换一台电脑 / 发给别人时，
+            # 对方看不到本机的提示列表，只能从文件里读。
+            _cols_str = ""
+            try:
+                if DESENS_COLS_MAP:
+                    _parts = []
+                    for _i in sorted(DESENS_COLS_MAP):
+                        _cs = ",".join(str(c) for c in sorted(DESENS_COLS_MAP[_i]))
+                        if _cs:
+                            _parts.append("%d:%s" % (_i, _cs))
+                    _cols_str = ";".join(_parts)
+                    if len(_cols_str) > 160:      # 属性长度有限，超了就退化为"全解"
+                        _cols_str = ""
+            except Exception:
+                _cols_str = ""
+            p.keywords = ("BFT_MASK_GEN=%d;SALT=%s;KEYFP=%s;HINT=%s;SRC=%s;BATCH=%s;"
+                          "MODE=%s;ROUNDS=%d;HDR=%d;COLS=%s;ALGO=fpe-v1") % (
+                masked_gen, salt or "-", keyfp or "-",
+                _b64(hint)[:80] or "-", _b64(src)[:80] or "-", batch or "-",
+                mode or ("rnd" if DESENS_RANDOMIZE else "det"),
+                rounds or DESENS_ROUNDS,
+                1 if DESENS_INCLUDE_HEADER else 0,
+                _cols_str or "-")
+            # 完整性印记单独放 description：keywords 已经很长，再塞 64 位会超字段长度
+            p.description = ("BFTSIG=%s" % sig) if sig else None
+        else:
+            p.keywords = None
+    except Exception as e:
+        log(f"元数据清理失败（不影响数据）：{e}")
+
+
+def _read_hint(wb):
+    """从文件属性里取回密码提示（base64）。"""
+    try:
+        kw = wb.properties.keywords or ""
+    except Exception:
+        return ""
+    m = re.search(r"HINT=([A-Za-z0-9_\-]+)", kw)
+    if not m or m.group(1) == "-":
+        return ""
+    return _unb64(m.group(1))
+
+
+def _read_cols_map(wb):
+    """返回 {sheet_index: [列号]}；老文件没有这项时返回 {}。"""
+    try:
+        kw = wb.properties.keywords or ""
+        m = re.search(r"COLS=([0-9:;,\-]+)", kw)
+        if not m or m.group(1) == "-":
+            return {}
+        out = {}
+        for part in m.group(1).split(";"):
+            if ":" not in part:
+                continue
+            i, cs = part.split(":", 1)
+            out[int(i)] = [int(x) for x in cs.split(",") if x.strip().isdigit()]
+        return out
+    except Exception:
+        return {}
+
+
+def _read_hdr_masked(wb):
+    try:
+        kw = wb.properties.keywords or ""
+        m = re.search(r"HDR=(\d)", kw)
+        return bool(int(m.group(1))) if m else False
+    except Exception:
+        return False
+
+
+def _read_rounds(wb):
+    try:
+        kw = wb.properties.keywords or ""
+        m = re.search(r"ROUNDS=(\d+)", kw)
+        return max(1, min(999, int(m.group(1)))) if m else DESENS_ROUNDS_DEFAULT
+    except Exception:
+        return DESENS_ROUNDS_DEFAULT
+
+
+def _read_mode(wb):
+    """返回 'det'（确定性）或 'rnd'（随机化）。"""
+    try:
+        kw = wb.properties.keywords or ""
+    except Exception:
+        return "det"
+    m = re.search(r"MODE=([a-z]+)", kw)
+    return (m.group(1) if m else "det")
+
+
+def _read_mask_marker(wb):
+    """返回 (代数, keyfp, salt_hex)；没标记返回 (0, '', '')。"""
+    try:
+        kw = wb.properties.keywords or ""
+    except Exception:
+        return 0, "", ""
+    m = re.search(r"BFT_MASK_GEN=(\d+)", kw)
+    if not m:
+        return 0, "", ""
+    g = int(m.group(1))
+    k = re.search(r"KEYFP=([0-9a-f]+)", kw)
+    s = re.search(r"SALT=([0-9a-fA-F]+)", kw)
+    return g, (k.group(1) if k else ""), (s.group(1) if s else "")
+
+
 class DesensitizeMapper:
-    def __init__(self):
+    """V1.8.0 内核。接口与旧版兼容：mask / unmask / save_mapping / load_mapping。"""
+
+    VERSION = "fpe-v1"
+
+    def __init__(self, password=None, salt=None):
+        self.salt = salt or secrets.token_bytes(16)
         self.orig_to_mask = {}
         self.mask_to_orig = {}
-        self.charset_digit = list(string.digits)
-        self.charset_lower = list(string.ascii_lowercase)
-        self.charset_upper = list(string.ascii_uppercase)
-        self.charset_ch = [chr(i) for i in range(0x4e00, 0x9fff) if chr(i).isalpha()]
+        self.legacy_to_orig = {}
+        self.manifest = {}
+        self.randomized = False
+        self.password = None
+        self.keyfp = ""
+        self._k_fpe = self._k_mac = self._k_wrap = b""
+        if password:
+            self.set_password(password)
 
-    def _random_char(self, ch_type, seed_str):
-        # V1.6.9：以前用内置 hash()，它每次启动进程都会随机加盐，
-        # 所以同一份数据两次运行会得到不同的脱敏结果（与“确定性脱敏”的说明不符）。
-        # 改用 md5 取种子，跨进程/跨机器都稳定；同时不再污染全局 random 状态。
-        h = int(hashlib.md5(seed_str.encode('utf-8')).hexdigest()[:8], 16)
-        rnd = random.Random(h)
-        if ch_type == 'digit':
-            result = rnd.choice(self.charset_digit)
-        elif ch_type == 'lower':
-            result = rnd.choice(self.charset_lower)
-        elif ch_type == 'upper':
-            result = rnd.choice(self.charset_upper)
-        elif ch_type == 'ch':
-            result = rnd.choice(self.charset_ch)
-        else:
-            result = seed_str
-        return result
+    # --- 密钥
+    def set_password(self, password):
+        self.password = password
+        master = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), self.salt, 200000, 32)
+        self._k_fpe = _hkdf(master, b"fpe")
+        self._k_mac = _hkdf(master, b"mac")
+        self._k_wrap = _hkdf(master, b"wrap")
+        self.keyfp = hmac.new(self._k_fpe, b"keyfp", hashlib.sha256).hexdigest()[:8]
 
-    def _generate_masked(self, s, salt=0):
-        masked_chars = []
-        for i, ch in enumerate(s):
-            seed = f"{s}_{i}" if not salt else f"{s}_{i}_{salt}"
-            if ch.isdigit():
-                masked_chars.append(self._random_char('digit', seed))
-            elif ch.islower():
-                masked_chars.append(self._random_char('lower', seed))
-            elif ch.isupper():
-                masked_chars.append(self._random_char('upper', seed))
-            elif '\u4e00' <= ch <= '\u9fff':
-                masked_chars.append(self._random_char('ch', seed))
+    @property
+    def ready(self):
+        return bool(self._k_fpe)
+
+    def _need_key(self):
+        if not self._k_fpe:
+            raise RuntimeError("未设置脱敏口令")
+
+    # --- 单段
+    def _seg(self, text, cls, tweak, forward=True):
+        alpha = _ALPHA[cls]
+        radix = len(alpha)
+        idx = {c: i for i, c in enumerate(alpha)}
+        x = 0
+        for ch in text:
+            x = x * radix + idx[ch]
+        n = radix ** len(text)
+        y = _fpe_forward(self._k_fpe, tweak, x, n) if forward else _fpe_backward(self._k_fpe, tweak, x, n)
+        out = []
+        for _ in range(len(text)):
+            y, r = divmod(y, radix)
+            out.append(alpha[r])
+        return "".join(reversed(out))
+
+    def _walk(self, s, tweak, forward):
+        tb = ("v1|" + self.VERSION + "|" + (tweak or "")).encode("utf-8")
+        out, buf, cur = [], [], None
+        for ch in s:
+            cls = _char_class(ch)
+            if cls is None:
+                if buf:
+                    out.append(self._seg("".join(buf), cur, tb, forward))
+                    buf, cur = [], None
+                out.append(ch)
             else:
-                masked_chars.append(ch)
-        return ''.join(masked_chars)
+                if cur is not None and cls != cur:
+                    out.append(self._seg("".join(buf), cur, tb, forward))
+                    buf = []
+                cur = cls
+                buf.append(ch)
+        if buf:
+            out.append(self._seg("".join(buf), cur, tb, forward))
+        return "".join(out)
 
-    def mask(self, original):
+    # --- 对外
+    def mask(self, original, tweak=""):
+        self._need_key()
         if original is None:
             return None
         s = str(original)
-        if s not in self.orig_to_mask:
-            masked = self._generate_masked(s)
-            salt = 0
-            # 两个不同原文万一撞到同一个脱敏串，还原就会串号；撞了换个盐重来
-            while masked in self.mask_to_orig and self.mask_to_orig[masked] != s and salt < 50:
-                salt += 1
-                masked = self._generate_masked(s, salt)
-            self.orig_to_mask[s] = masked
-            self.mask_to_orig[masked] = s
-        return self.orig_to_mask[s]
+        if DESENS_RANDOMIZE:
+            # 随机化：每格一个 2 字随机 nonce 拼在最前面，作为这一格的 tweak 种子。
+            # 同值不同格 -> nonce 不同 -> 密文不同；解密时把 nonce 剥出来重建 tweak。
+            _alpha = _ALPHA["cjk"]
+            nonce = _alpha[secrets.randbelow(len(_alpha))] + _alpha[secrets.randbelow(len(_alpha))]
+            res = nonce + self._walk(s, tweak + "|rnd|" + nonce, True)
+        else:
+            res = self._walk(s, tweak, True)
+        self.orig_to_mask.setdefault(s, res)
+        self.mask_to_orig.setdefault(res, s)
+        return res
 
-    def unmask(self, masked):
+    def unmask(self, masked, tweak=""):
         if masked is None:
             return None
-        return self.mask_to_orig.get(str(masked), masked)
+        s = str(masked)
+        if s in self.legacy_to_orig:
+            return self.legacy_to_orig[s]
+        if not self._k_fpe:
+            return s
+        if getattr(self, "randomized", False) and len(s) >= 2:
+            _c0, _c1 = s[0], s[1]
+            if _char_class(_c0) == "cjk" and _char_class(_c1) == "cjk":
+                nonce, body = _c0 + _c1, s[2:]
+                if body:
+                    return self._walk(body, tweak + "|rnd|" + nonce, False)
+        return self._walk(s, tweak, False)
 
-    def save_mapping(self, file_path):
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'orig_to_mask': self.orig_to_mask,
-                'mask_to_orig': self.mask_to_orig
-            }, f, ensure_ascii=False, indent=2)
+    # --- 金库：映射表落盘即密文
+    def vault_bytes(self, manifest=None):
+        self._need_key()
+        _payload = {
+            "version": self.VERSION,
+            "keyfp": self.keyfp,
+            "rounds": DESENS_ROUNDS,
+            "orig_to_mask": self.orig_to_mask,
+        }
+        if manifest:
+            _payload["manifest"] = manifest
+        payload = json.dumps(_payload, ensure_ascii=False).encode("utf-8")
+        nonce = secrets.token_bytes(16)
+        ks = _keystream(self._k_wrap, nonce, len(payload))
+        ct = bytes(a ^ b for a, b in zip(payload, ks))
+        tag = hmac.new(self._k_mac, self.salt + nonce + ct, hashlib.sha256).digest()
+        return _VAULT_MAGIC + self.salt + nonce + tag + ct
 
-    def load_mapping(self, file_path):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        self.orig_to_mask = data['orig_to_mask']
-        self.mask_to_orig = data['mask_to_orig']
+    def save_mapping(self, file_path, manifest=None):
+        with open(file_path, "wb") as f:
+            f.write(self.vault_bytes(manifest))
+
+    def load_mapping(self, file_path, password=None):
+        """兼容三样：.vault（口令解）、旧 .json（明文，只做只读兜底）。"""
+        path = str(file_path)
+        raw = open(path, "rb").read()
+        if raw.startswith(_VAULT_MAGIC):
+            salt = raw[len(_VAULT_MAGIC):len(_VAULT_MAGIC) + 16]
+            off = len(_VAULT_MAGIC) + 16
+            nonce, tag, ct = raw[off:off + 16], raw[off + 16:off + 48], raw[off + 48:]
+            pwd = password or self.password
+            if not pwd:
+                raise RuntimeError("金库需要口令")
+            master = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, 200000, 32)
+            k_mac = _hkdf(master, b"mac")
+            k_wrap = _hkdf(master, b"wrap")
+            if not hmac.compare_digest(tag, hmac.new(k_mac, salt + nonce + ct, hashlib.sha256).digest()):
+                raise RuntimeError("口令错误（金库校验失败）")
+            ks = _keystream(k_wrap, nonce, len(ct))
+            data = json.loads(bytes(a ^ b for a, b in zip(ct, ks)).decode("utf-8"))
+            self.salt = salt
+            self.set_password(pwd)
+            self.orig_to_mask = data.get("orig_to_mask", {})
+            self.mask_to_orig = {v: k for k, v in self.orig_to_mask.items()}
+            self.manifest = data.get("manifest", {})
+            return True
+        # 旧明文 JSON：只当"只读反查表"用，不参与新脱敏
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+            self.legacy_to_orig = data.get("mask_to_orig", {})
+            self.mask_to_orig.update(self.legacy_to_orig)
+            return True
+        except Exception as e:
+            raise RuntimeError("映射文件读不出来：%s" % e)
+
 
 desensitize_mapper = DesensitizeMapper()
 
@@ -1549,16 +2130,10 @@ def process_block(ws, wb, block_start, block_end, block_idx, header_row, enable_
                 if cleaned is not None:
                     cell.value = cleaned
 
-    # 脱敏
-    if enable_desensitize and desensitize_cols:
-        for col in desensitize_cols:
-            if col is None:
-                continue
-            for row in range(block_start, block_end + 1):
-                cell = ws.cell(row, col)
-                if cell.value is None:
-                    continue
-                cell.value = desensitize_mapper.mask(cell.value)
+    # 脱敏：V1.8.0 起只由 process_worksheet_multi 的 _mask_sheet_columns 统一执行一次。
+    # 原来这里还有一段按列索引的 mask 循环，没有 _mask_already 守卫，
+    # 导致同一格被连续脱敏两代（文件里是 gen2/gen3，映射表只到 gen1 -> 还原不出来）。
+    _ = (enable_desensitize, desensitize_cols)
 
     # 收集对手方数据（含ID）—— 必须放在插入求和行之前，
     # 否则 insert_rows 会把行整体下移，收集区间错位。
@@ -1800,9 +2375,10 @@ def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
     这样一张表里堆了多张不同表头的表也能各自命中。
     """
     total = 0
+    _hit_cols = set()
     wanted = set(t.strip() for t in (wanted_titles or []) if t and t.strip())
     if not wanted:
-        return total
+        return total, _hit_cols
     segs = _sheet_segments(ws, ws.max_column)
     if not segs:
         segs = [(fallback_header or 1, ws.max_row)]
@@ -1814,7 +2390,8 @@ def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
             title = cell_text(ws.cell(row=hdr, column=col).value).strip()
             if not title or title not in wanted:
                 continue
-            for r in range(hdr + 1, e + 1):
+            _start = hdr if DESENS_INCLUDE_HEADER else hdr + 1
+            for r in range(_start, e + 1):
                 cell = ws.cell(row=r, column=col)
                 v = cell.value
                 if v is None:
@@ -1825,7 +2402,8 @@ def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
                     continue
                 cell.value = desensitize_mapper.mask(v)
                 total += 1
-    return total
+                _hit_cols.add(col)
+    return total, _hit_cols
 
 
 def _parse_row_input(text, fallback=1):
@@ -1851,9 +2429,11 @@ def _mask_columns_whole(ws, header_row, cols):
     通用表格（没有金额列、切不出区块）单独用脱敏时走这条路。
     """
     n = 0
+    _hit = set()
     if not cols:
-        return n
-    start = int(header_row or 1) + 1
+        return n, _hit
+    _hr = int(header_row or 1)
+    start = _hr if DESENS_INCLUDE_HEADER else _hr + 1
     max_row = ws.max_row
     for col in cols:
         if col is None:
@@ -1869,7 +2449,8 @@ def _mask_columns_whole(ws, header_row, cols):
                 continue
             cell.value = desensitize_mapper.mask(v)
             n += 1
-    return n
+            _hit.add(col)
+    return n, _hit
 
 
 def process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stats, collect_data,
@@ -1888,17 +2469,30 @@ def process_worksheet_multi(ws, wb, sheet_name, enable_sum, enable_internal_stat
     if header_row is None:
         header_row = detect_header_row(ws, max_row, max_col)
 
-    # 脱敏独立于流水区块：整列脱敏先做，通用表格也能用
+    # 脱敏独立于流水区块：整列脱敏先做，通用表格也能用。
+    # V1.8.7：这是【唯一】脱敏入口。金额列不再特殊对待 ——
+    # 脱敏和金额梳理已经互斥（fix_files 会把求和/统计/汇总/金额清理全关掉），
+    # 所以金额列加密不会污染任何统计，勾了就该加密。
     if enable_desensitize and (desensitize_titles or desensitize_cols):
-        if desensitize_titles:
-            _n_masked = _mask_sheet_columns(ws, desensitize_titles, header_row)
+        if not desensitize_mapper.ready:
+            warn("已勾选脱敏但没有口令，本工作表未脱敏")
         else:
-            _n_masked = _mask_columns_whole(ws, header_row, desensitize_cols)
-        if _n_masked:
-            log(f"脱敏：工作表「{sheet_name}」共处理 {_n_masked} 个单元格")
+            if desensitize_titles:
+                _n_masked = _mask_sheet_columns(ws, desensitize_titles, header_row)
+            else:
+                _n_masked = _mask_columns_whole(ws, header_row, desensitize_cols)
+            if _n_masked:
+                log(f"脱敏：工作表「{sheet_name}」共处理 {_n_masked[0]} 个单元格（单次）")
+                record_masked_cols(wb, sheet_name, _n_masked[1])
     # 表头都没识别出来，说明这张表多半不是流水表：细节只写日志，不刷屏
     _sheet_ctx["sheet"] = sheet_name
     _sheet_ctx["quiet"] = _sheet_ctx["header_score"] < 2
+    if enable_desensitize and not (enable_sum or enable_internal_stats or collect_data or enable_money_clean):
+        # 纯脱敏模式：不做区块切分、不找金额列、不出统计，
+        # 也就不会有"未找到金额列，已跳过该区块"这种跟脱敏无关的诊断
+        log(f"工作表「{sheet_name}」脱敏完成，跳过区块识别（脱敏模式不做统计）")
+        return []
+
     blocks = find_blocks(ws, max_row, max_col, header_row)
     if not blocks:
         return []
@@ -2032,6 +2626,12 @@ def process_csv(file_path, enable_sum, enable_internal_stats, collect_data,
                                    enable_desensitize, desensitize_cols, enable_money_clean, header_row,
                                    desensitize_titles=_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
+    if enable_desensitize and desensitize_mapper.ready:
+        _sig = _table_signature(desensitize_mapper, wb)
+        _scrub_metadata(wb, 1, desensitize_mapper.keyfp, desensitize_mapper.salt.hex(),
+                        DESENS_HINT, file_path.name, DESENS_BATCH, "", DESENS_ROUNDS, _sig)
+    else:
+        _scrub_metadata(wb, 0, "", "")
     wb.save(output_path)
     return output_path, data
 
@@ -2056,6 +2656,12 @@ def process_old_xls(file_path, enable_sum, enable_internal_stats, collect_data,
                                    enable_desensitize, desensitize_cols, enable_money_clean, header_row,
                                    desensitize_titles=_titles)
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
+    if enable_desensitize and desensitize_mapper.ready:
+        _sig = _table_signature(desensitize_mapper, wb)
+        _scrub_metadata(wb, 1, desensitize_mapper.keyfp, desensitize_mapper.salt.hex(),
+                        DESENS_HINT, file_path.name, DESENS_BATCH, "", DESENS_ROUNDS, _sig)
+    else:
+        _scrub_metadata(wb, 0, "", "")
     wb.save(output_path)
     return output_path, data
 
@@ -2065,6 +2671,9 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
                  desensitize_by_sheet=None):
     file_path = Path(file_path)
     wb = load_workbook(file_path, data_only=True)
+    _gen, _kfp, _salt = _read_mask_marker(wb)
+    if _gen and enable_desensitize:
+        raise Exception("该文件已是第 %d 代脱敏结果，拒绝再次脱敏（请先用「还原脱敏」解开）" % _gen)
     all_data = []
     for sheet_name in list(wb.sheetnames):
         # V1.6.9：重复处理“已处理”文件时，不能把上次生成的统计表再当数据表统计
@@ -2095,6 +2704,12 @@ def process_xlsx(file_path, enable_sum, enable_internal_stats, collect_data,
             # 单个工作表出错不再拖垮整批文件
             warn(f"工作表「{sheet_name}」处理失败：{e}（已跳过该工作表，其余工作表继续）")
     output_path = file_path.parent / f"{file_path.stem}_已处理.xlsx"
+    if enable_desensitize and desensitize_mapper.ready:
+        _sig = _table_signature(desensitize_mapper, wb)
+        _scrub_metadata(wb, 1, desensitize_mapper.keyfp, desensitize_mapper.salt.hex(),
+                        DESENS_HINT, file_path.name, DESENS_BATCH, "", DESENS_ROUNDS, _sig)
+    else:
+        _scrub_metadata(wb, 0, "", "")
     wb.save(output_path)
     return output_path, all_data
 
@@ -2103,8 +2718,28 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
               enable_desensitize, desensitize_titles, enable_money_clean,
               progress_callback, finish_callback, overrides=None):
     global desensitize_mapper
-    # 每轮处理都从干净的映射表开始，避免上一轮的映射混进来
-    desensitize_mapper = DesensitizeMapper()
+    # V1.8.7：互斥不只做在界面上，后端也强制一遍 ——
+    # 走代码/命令行调用时不会有 GUI 帮你清零，金额列加密后要是还在算求和，数就成了密文的和。
+    if enable_desensitize and (enable_sum or enable_internal_stats or enable_cross_summary
+                               or enable_money_clean or manual_mode):
+        log("脱敏模式：已忽略 求和/内部统计/跨文件汇总/金额清理/手动选列（与脱敏互斥）")
+        enable_sum = False
+        enable_internal_stats = False
+        enable_cross_summary = False
+        enable_money_clean = False
+        manual_mode = False
+    # V1.8.8：给这一批文件一个共同批次号（写进每个文件属性，代替原来的金库清单）
+    set_desens_batch(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    # V1.8.0：每轮用"口令 + 本批随机盐"重建内核，映射表不再是必需物
+    desensitize_mapper = DesensitizeMapper(password=DESENS_PASSWORD)
+    if enable_desensitize and not DESENS_PASSWORD:
+        warn("已勾选“启用信息脱敏”，但没有设置口令，本次不会脱敏")
+    elif enable_desensitize:
+        log(f"脱敏内核 = {DesensitizeMapper.VERSION}，口令指纹 = {desensitize_mapper.keyfp}")
+        try:
+            save_password_hint(DESENS_HINT, desensitize_mapper.keyfp, desensitize_mapper.salt.hex())
+        except Exception:
+            pass
     diagnostics.clear()
     log("=" * 25 + " 新一轮处理开始 " + "=" * 25)
     log(f"开始处理，文件数量: {len(file_paths)}")
@@ -2123,6 +2758,11 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
         for idx, file_path_str in enumerate(file_paths):
             file_path = Path(file_path_str)
             log(f"处理文件 {idx+1}/{total}: {file_path.name}")
+            reset_masked_cols()
+            if enable_desensitize and DESENS_PER_FILE_SALT and DESENS_PASSWORD:
+                # 一份文件一把盐：每个文件重新派生子密钥，密文互不相通
+                desensitize_mapper = DesensitizeMapper(password=DESENS_PASSWORD)
+                log("  一份文件一把盐：本文件独立盐 = %s" % desensitize_mapper.salt.hex()[:12])
             progress_callback(idx + 1, total, file_path.name)
             _hr = None
             _dbs = None
@@ -2167,16 +2807,13 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
                 all_collected.extend(data)
                 log(f"  收集到 {len(data)} 条对手方明细")
 
-        if enable_desensitize and desensitize_mapper.orig_to_mask:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            mapping_path = Path(file_paths[0]).parent / f"脱敏映射_{timestamp}.json"
-            try:
-                desensitize_mapper.save_mapping(mapping_path)
-                remember_dir(mapping_path)
-                log(f"脱敏映射已保存至: {mapping_path}")
-            except Exception as e:
-                mapping_path = None
-                warn(f"脱敏映射保存失败：{e}")
+        if enable_desensitize and desensitize_mapper.ready:
+            # V1.8.8：不再生成金库。
+            # 密钥 = PBKDF2(口令, salt)，salt 写在每个 xlsx 的自定义属性里，
+            # 所以"换一台电脑、发给别人，只要输同一个口令"就能还原，
+            # 不需要任何附带的映射/金库文件。
+            log("脱敏完成：未生成金库文件（密钥由口令+文件内 salt 决定，凭口令即可还原）"
+                "；本批批次号 = %s" % (DESENS_BATCH or "-"))
 
         log(f"汇总数据总量: {len(all_collected)} 条")
         if enable_cross_summary:
@@ -2218,8 +2855,6 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
                 msg_parts.append(f"汇总统计表已生成：{summary_path}")
             elif len(file_paths) > 1:
                 msg_parts.append("未生成跨文件汇总表（原因见下方诊断）。")
-        if mapping_path:
-            msg_parts.append(f"脱敏映射已保存：{mapping_path}")
         if enable_internal_stats:
             msg_parts.append("已在处理后的文档里按工作表生成“工作表名+对手方统计汇总”（无有效数据的工作表会跳过，原因见下）。")
         if diagnostics:
@@ -2239,55 +2874,451 @@ def fix_files(file_paths, enable_sum, enable_internal_stats, enable_cross_summar
         log_exc(f"处理出错：{e}")
         finish_callback(False, f"处理出错：{e}", None)
 
-# ---------- 还原功能 ----------
+# ---------- 口令对话框（参照 Windows 账户设置） ----------
+_HINT_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "BankFlowTool")
+_HINT_FILE = os.path.join(_HINT_DIR, "password_hints.json")
+DESENS_HINT = ""
+
+
+def set_desens_hint(h):
+    global DESENS_HINT
+    DESENS_HINT = (h or "").strip()
+
+
+def load_password_hints():
+    try:
+        with open(_HINT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [d for d in data if isinstance(d, dict)]
+    except Exception:
+        return []
+
+
+def save_password_hint(hint, keyfp="", salt=""):
+    """只存"提示 + 指纹 + 盐"，绝不存口令本身。指纹只够校验对错，反推不出口令。"""
+    hint = (hint or "").strip()
+    if not hint and not (keyfp and salt):
+        return
+    try:
+        os.makedirs(_HINT_DIR, exist_ok=True)
+        items = [r for r in load_password_hints() if not (keyfp and r.get("keyfp") == keyfp)]
+        items.insert(0, {
+            "hint": hint,
+            "keyfp": keyfp or "",
+            "salt": salt or "",
+            "used_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+        items = items[:20]
+        tmp = _HINT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _HINT_FILE)
+    except Exception as e:
+        log(f"密码提示保存失败（不影响使用）：{e}")
+
+
+def _eye_widget(parent, entry, bg):
+    """画一只小眼睛：点一下在明文/密文之间切换。"""
+    cv = tk.Canvas(parent, width=28, height=20, highlightthickness=0, bg=bg, cursor="hand2")
+    cv.create_oval(3, 5, 25, 15, outline="#555", width=1)
+    pupil = cv.create_oval(10, 7, 18, 13, fill="#333", outline="")
+    slash = cv.create_line(4, 17, 24, 3, fill="#c0392b", width=1.6, state="hidden")
+
+    def toggle(_e=None):
+        try:
+            hidden = bool(entry.cget("show"))
+            entry.config(show="" if hidden else "*")
+            cv.itemconfig(pupil, state="hidden" if hidden else "normal")
+            cv.itemconfig(slash, state="normal" if hidden else "hidden")
+            entry.focus_set()
+        except Exception:
+            pass
+
+    cv.bind("<Button-1>", toggle)
+    try:
+        entry._toggle_show = toggle      # 也给键盘/测试留个入口
+    except Exception:
+        pass
+    return cv
+
+
+def _pwd_strength(p):
+    """返回 (等级, 颜色, 一句人话)。只评估，不拦。"""
+    n = len(p)
+    if n == 0:
+        return ("", "#888888", "输入口令后这里显示强度")
+    has_d = any(c.isdigit() for c in p)
+    has_l = any("a" <= c <= "z" for c in p)
+    has_u = any("A" <= c <= "Z" for c in p)
+    has_s = any(not c.isalnum() for c in p)
+    kinds = sum([has_d, has_l, has_u, has_s])
+    if n < 6:
+        return ("太短", "#c0392b", "至少 6 位才能真正加密")
+    if n <= 7 and kinds <= 1:
+        return ("很弱", "#c0392b", "%d 位全是同一类字符，单卡几分钟到几小时能撞开" % n)
+    score = n + kinds * 3
+    if score < 14:
+        return ("偏弱", "#b8860b", "长度够，但字类单一，经不住针对性字典")
+    if score < 20:
+        return ("一般", "#b8860b", "能用。再加长一点或掺个符号会更稳")
+    if score < 30:
+        return ("不错", "#0a5", "这个长度，撞库基本没戏")
+    return ("很强", "#0a5", "够用了")
+
+class PasswordDialog(tk.Toplevel):
+    """mode='set' 设置口令；mode='restore' 输入口令并即时校验。"""
+
+    def __init__(self, parent, mode="set", keyfp="", salt="", note=""):
+        tk.Toplevel.__init__(self, parent)
+        self.result = None
+        self.mode = mode
+        self.keyfp = (keyfp or "").strip().lower()
+        self.salt = (salt or "").strip()
+        self._hint_map = {}
+        self.title("设置脱敏口令" if mode == "set" else "输入脱敏口令")
+        self.resizable(False, False)
+        bg = "#f7f7f7"
+        self.configure(bg=bg, padx=18, pady=14)
+        try:
+            self.transient(parent)
+            self.grab_set()
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        if mode == "set":
+            head = "设置本次脱敏的口令"
+            sub = "口令是唯一的还原钥匙：不落盘、不写日志。忘了就再也解不开。"
+        else:
+            head = "输入脱敏时用的口令"
+            sub = note or "凭口令即可还原，不再依赖映射文件。"
+        tk.Label(self, text=head, bg=bg, font=("微软雅黑", 11, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        tk.Label(self, text=sub, bg=bg, fg="#666", font=("微软雅黑", 9),
+                 wraplength=400, justify="left").grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
+
+        r = 2
+        if mode == "set":
+            tk.Label(self, text="密码提示", bg=bg, font=("微软雅黑", 9)).grid(
+                row=r, column=0, sticky="e", padx=(0, 8), pady=3)
+            self.hint_var = tk.StringVar(value=DESENS_HINT)
+            tk.Entry(self, textvariable=self.hint_var, width=36, font=("微软雅黑", 10)).grid(
+                row=r, column=1, columnspan=2, sticky="we", pady=3)
+            tk.Label(self, text="（可留空。还原时它会列出来，帮你想起口令）", bg=bg, fg="#888",
+                     font=("微软雅黑", 8)).grid(row=r + 1, column=1, columnspan=2, sticky="w")
+            r += 2
+        else:
+            hints = load_password_hints()
+            labels = []
+            for it in hints:
+                h = (it.get("hint") or "").strip() or "（未填提示）"
+                lab = "%s    %s" % (it.get("used_at", ""), h)
+                labels.append(lab)
+                self._hint_map[lab] = it
+            if labels:
+                tk.Label(self, text="已记录的提示", bg=bg, font=("微软雅黑", 9)).grid(
+                    row=r, column=0, sticky="e", padx=(0, 8), pady=3)
+                self.hint_cb = ttk.Combobox(self, values=labels, state="readonly",
+                                            width=34, font=("微软雅黑", 9))
+                self.hint_cb.grid(row=r, column=1, columnspan=2, sticky="we", pady=3)
+                self.hint_cb.bind("<<ComboboxSelected>>", self._on_hint_pick)
+                r += 1
+                self.hint_label = tk.Label(self, text="（选一条就知道当时写的是什么提示）", bg=bg,
+                                           fg="#0a5", font=("微软雅黑", 10, "bold"),
+                                           wraplength=400, justify="left")
+                self.hint_label.grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 6))
+                r += 1
+
+        tk.Label(self, text="口令", bg=bg, font=("微软雅黑", 9)).grid(
+            row=r, column=0, sticky="e", padx=(0, 8), pady=3)
+        self.pwd_entry = tk.Entry(self, show="*", width=36, font=("微软雅黑", 10))
+        self.pwd_entry.grid(row=r, column=1, sticky="we", pady=3)
+        _eye_widget(self, self.pwd_entry, bg).grid(row=r, column=2, padx=(4, 0))
+        self.pwd_entry.bind("<KeyRelease>", self._on_change)
+        r += 1
+
+        if mode == "set":
+            tk.Label(self, text="确认口令", bg=bg, font=("微软雅黑", 9)).grid(
+                row=r, column=0, sticky="e", padx=(0, 8), pady=3)
+            self.pwd2_entry = tk.Entry(self, show="*", width=36, font=("微软雅黑", 10))
+            self.pwd2_entry.grid(row=r, column=1, sticky="we", pady=3)
+            _eye_widget(self, self.pwd2_entry, bg).grid(row=r, column=2, padx=(4, 0))
+            self.pwd2_entry.bind("<KeyRelease>", self._on_change)
+            r += 1
+
+        if mode == "set":
+            self.strength_label = tk.Label(self, text="", bg=bg, font=("微软雅黑", 9),
+                                           wraplength=400, justify="left")
+            self.strength_label.grid(row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            r += 1
+
+        self.state_label = tk.Label(self, text="", bg=bg, font=("微软雅黑", 9),
+                                    wraplength=400, justify="left")
+        self.state_label.grid(row=r, column=0, columnspan=3, sticky="w", pady=(2, 8))
+        r += 1
+
+        btns = tk.Frame(self, bg=bg)
+        btns.grid(row=r, column=0, columnspan=3, sticky="e")
+        self.ok_btn = tk.Button(btns, text="确定", width=10, font=("微软雅黑", 9), command=self._ok)
+        self.ok_btn.pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="取消", width=10, font=("微软雅黑", 9), command=self._cancel).pack(side=tk.LEFT)
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.pwd_entry.focus_set()
+        self._on_change()
+        self.update_idletasks()
+        try:
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            pw = max(parent.winfo_width(), 400)
+            ph = max(parent.winfo_height(), 300)
+            w, h = self.winfo_width(), self.winfo_height()
+            self.geometry("+%d+%d" % (px + (pw - w) // 2, py + (ph - h) // 3))
+        except Exception:
+            pass
+
+    # --- 交互
+    def _on_change(self, _e=None):
+        if self.mode != "set":
+            return
+        try:
+            p1 = self.pwd_entry.get()
+            p2 = self.pwd2_entry.get()
+        except Exception:
+            return
+        # 强度：随口令实时变，跟确认框填没填无关
+        try:
+            lvl, color, tip = _pwd_strength(p1)
+            self.strength_label.config(
+                text=("强度：%s —— %s" % (lvl, tip)) if lvl else tip, fg=color)
+        except Exception:
+            pass
+
+        # 一致性：只在"该判的时候"才判
+        _tip = "口令至少 6 位，建议 8 位以上，含数字、大小写英文字符等"
+        if len(p1) < 6:
+            self.state_label.config(text=_tip, fg="#c0392b")
+            self.ok_btn.config(state=tk.DISABLED)
+        elif not p2:
+            self.state_label.config(text=_tip, fg="#888888")
+            self.ok_btn.config(state=tk.DISABLED)
+        elif p2 != p1:
+            self.state_label.config(text="两次输入不一致", fg="#c0392b")
+            self.ok_btn.config(state=tk.DISABLED)
+        else:
+            self.state_label.config(text="✓ 两次一致，可以点确定", fg="#0a5")
+            self.ok_btn.config(state=tk.NORMAL)
+
+    def _on_hint_pick(self, _e=None):
+        it = self._hint_map.get(self.hint_cb.get()) or {}
+        h = (it.get("hint") or "").strip()
+        self.hint_label.config(text="提示：" + (h if h else "（这条没填提示）"))
+
+    def _cancel(self):
+        self.result = None
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+    def _ok(self):
+        pwd = self.pwd_entry.get()
+        if self.mode == "set":
+            if len(pwd) < 6 or pwd != self.pwd2_entry.get():
+                return
+            self.result = {"password": pwd, "hint": self.hint_var.get().strip()}
+            try:
+                self.grab_release()
+            except Exception:
+                pass
+            self.destroy()
+            return
+
+        if not pwd:
+            self.state_label.config(text="请输入口令", fg="#c0392b")
+            return
+        if self.keyfp and self.salt:
+            self.state_label.config(text="正在校验口令…", fg="#666")
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            try:
+                probe = DesensitizeMapper(password=pwd, salt=bytes.fromhex(self.salt))
+                if probe.keyfp != self.keyfp:
+                    self.state_label.config(
+                        text="✗ 口令不对（和文件里记录的指纹 %s 不符），再试试" % self.keyfp, fg="#c0392b")
+                    self.pwd_entry.select_range(0, tk.END)
+                    self.pwd_entry.focus_set()
+                    return
+                self.state_label.config(text="✓ 口令正确", fg="#0a5")
+            except Exception:
+                pass
+        self.result = {"password": pwd, "hint": ""}
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
+def _ask_password(mode, keyfp="", salt="", note=""):
+    parent = tk._default_root
+    if parent is None:
+        return None
+    dlg = PasswordDialog(parent, mode=mode, keyfp=keyfp, salt=salt, note=note)
+    parent.wait_window(dlg)
+    return dlg.result
+
+
+# ---------- 还原功能（V1.8.3：口令直解 + 提示列表 + 指纹即时校验） ----------
 def restore_file():
     file_path = filedialog.askopenfilename(
-        title="请选择已脱敏的 Excel 或 CSV 文件",
+        title="选择已脱敏的 Excel 或 CSV 文件（凭口令还原，不需要任何附带文件）",
         initialdir=last_dir(),
         filetypes=[("Excel/CSV 文件", "*.xlsx *.xls *.csv"), ("所有文件", "*.*")]
     )
     if not file_path:
         return
-    mapping_path = filedialog.askopenfilename(
-        title="请选择对应的脱敏映射文件（.json）",
-        initialdir=os.path.dirname(os.path.abspath(file_path)) or last_dir(),
-        filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
-    )
-    if not mapping_path:
+
+    # 先从文件里读脱敏标记：代数 / salt / 指纹
+    gen, kfp, salt_hex = 0, "", ""
+    try:
+        if Path(file_path).suffix.lower() == ".xlsx":
+            _wb = load_workbook(file_path, read_only=True, data_only=True)
+            try:
+                gen, kfp, salt_hex = _read_mask_marker(_wb)
+                globals()["_file_hint"] = _read_hint(_wb)
+                globals()["_file_mode"] = _read_mode(_wb)
+                globals()["_file_rounds"] = _read_rounds(_wb)
+                globals()["_file_cols"] = _read_cols_map(_wb)
+                globals()["_file_hdr"] = _read_hdr_masked(_wb)
+            finally:
+                _wb.close()
+    except Exception as e:
+        log(f"读取脱敏标记失败（继续尝试还原）：{e}")
+    log(f"待还原文件: {file_path} | 代数={gen} 指纹={kfp or '-'} salt={'有' if salt_hex else '无'}")
+
+    if gen >= 2:
+        warn("这个文件是第 %d 代脱敏（历史遗留的多代叠加），只能恢复出第 %d 代的值，"
+             "要真正还原本请用 restore_multigen.py 走多代反查。" % (gen, gen - 1))
+
+    note = ""
+    _fh = globals().pop("_file_hint", "") or ""
+    if _fh:
+        note = "文件里记着提示：%s\n" % _fh
+    if kfp:
+        note += "已从文件读到校验指纹 %s，输错会当场提示。" % kfp
+
+    if gen and not salt_hex:
+        messagebox.showerror(
+            "这个文件得先用老办法解",
+            "它里面没记录 salt —— 那份文件是 V1.8.2 及更早版本生成的，\n"
+            "当年随机盐只存在金库文件里，光凭口令算不出同一个密钥。\n\n"
+            "两条路：\n"
+            "  1) 找到同批次的 脱敏金库_*.vault + 老版本软件还原；\n"
+            "  2) 直接拿原始数据用 V1.8.8 重跑一遍，以后就只认口令，不再有金库。")
+        return
+
+    got = _ask_password("restore", keyfp=kfp, salt=salt_hex, note=note)
+    if not got:
+        messagebox.showinfo("已取消", "还原需要口令。")
+        return
+    pwd = got["password"]
+
+    try:
+        if salt_hex:
+            mapper = DesensitizeMapper(password=pwd, salt=bytes.fromhex(salt_hex))
+        else:
+            mapper = DesensitizeMapper(password=pwd)
+        mapper.randomized = (globals().pop("_file_mode", "det") == "rnd")
+        set_desens_rounds(globals().pop("_file_rounds", DESENS_ROUNDS_DEFAULT))
+        if kfp and mapper.keyfp != kfp:
+            messagebox.showerror(
+                "口令不对",
+                "按这个口令算出来的指纹是 %s，文件里记录的是 %s。\n"
+                "继续下去只会得到乱码。" % (mapper.keyfp, kfp))
+            return
+    except Exception as e:
+        messagebox.showerror("错误", "准备密钥失败：%s" % e)
         return
 
     try:
-        mapper = DesensitizeMapper()
-        mapper.load_mapping(mapping_path)
-
         file_ext = Path(file_path).suffix.lower()
         if file_ext == '.csv':
             wb = grid_to_workbook(read_csv_grid(file_path))
-            output_path = Path(file_path).parent / f"{Path(file_path).stem}_还原.xlsx"
         elif file_ext == '.xls':
-            # V1.6.9：openpyxl 读不了旧版 .xls，先用 pandas+xlrd 转成新工作簿再还原
             df = pd.read_excel(file_path, header=None, dtype=str, engine='xlrd')
             df = df.astype(object).where(pd.notna(df), None)
             wb = grid_to_workbook(df.values.tolist())
-            output_path = Path(file_path).parent / f"{Path(file_path).stem}_还原.xlsx"
         elif file_ext == '.xlsx':
             wb = load_workbook(file_path, data_only=True)
-            output_path = Path(file_path).parent / f"{Path(file_path).stem}_还原.xlsx"
         else:
             messagebox.showerror("错误", "不支持的文件格式")
             return
 
-        for sheet in wb.worksheets:
-            for row in sheet.iter_rows():
+        _sig_saved = _read_sig(wb)
+        if _sig_saved:
+            _sig_now = _table_signature(mapper, wb)
+            if _sig_now == _sig_saved:
+                log("完整性校验通过：文件内容和加密时一致")
+            else:
+                log("完整性校验失败：内容与加密时不一致")
+                if not messagebox.askyesno(
+                        "这份数据被改过",
+                        "文件内容和当初加密的那份不一致 —— 有人动过它。\n\n"
+                        "改过之后解出来的名字可能是错的，而你还会以为那是真的。\n\n"
+                        "仍然要继续还原吗？（建议先找发件人重新要一份）"):
+                    return
+        else:
+            log("这个文件没有完整性印记（V1.9.8 及更早生成），跳过校验")
+
+        out_path = Path(file_path).parent / f"{Path(file_path).stem}_还原.xlsx"
+        changed, sample = 0, []
+        _cmap = globals().pop("_file_cols", {}) or {}
+        _hdr_masked = bool(globals().pop("_file_hdr", False))
+        for _si, sheet in enumerate(wb.worksheets):
+            _cols = set(_cmap.get(_si) or [])
+            if _hdr_masked:
+                # 表头也加密了：从第 1 行开始解，但仍然只解真正加密过的列，
+                # 否则用户没勾的列（比如金额列）会被误解成乱码
+                _start_row, _only = 1, (set(_cols) if _cols else None)
+            elif _cols:
+                # 只解真正加密过的列，从表头下一行开始 —— 否则明文表头会被解成乱码
+                try:
+                    _h = detect_header_row(sheet, sheet.max_row, sheet.max_column)
+                except Exception:
+                    _h = 1
+                _start_row, _only = _h + 1, _cols
+            else:
+                # 老文件没记录列：保持原来的全表解
+                _start_row, _only = 1, None
+            for row in sheet.iter_rows(min_row=_start_row):
                 for cell in row:
-                    if cell.value is not None and isinstance(cell.value, str):
-                        original = mapper.unmask(cell.value)
-                        if original != cell.value:
-                            cell.value = original
-        wb.save(output_path)
-        messagebox.showinfo("完成", f"还原完成！\n已保存至：{output_path}")
+                    if cell.value is None or not isinstance(cell.value, str):
+                        continue
+                    if _only is not None and cell.column not in _only:
+                        continue
+                    before = cell.value
+                    after = mapper.unmask(before)
+                    if after != before:
+                        cell.value = after
+                        changed += 1
+                        if len(sample) < 5:
+                            sample.append("%s: %s -> %s" % (cell.coordinate, before[:14], after[:14]))
+
+        _scrub_metadata(wb, 0, "", "")
+        wb.save(out_path)
+        log(f"还原完成：{out_path}，替换 {changed} 个单元格")
+        messagebox.showinfo(
+            "完成",
+            "还原完成！共替换 %d 个单元格。\n已保存至：\n%s\n\n样例：\n%s"
+            % (changed, out_path, "\n".join(sample) if sample else "（没有可还原的内容）"))
     except Exception as e:
+        log_exc("还原失败")
         messagebox.showerror("错误", f"还原失败：{e}")
+
 
 # ---------- GUI ----------
 class App:
@@ -2297,12 +3328,16 @@ class App:
         self.root.geometry("680x850")
         self.root.configure(bg="#f0f0f0")
 
-        self.enable_money_clean = BooleanVar(value=True)
+        self.enable_money_clean = BooleanVar(value=False)
         self.enable_sum = BooleanVar(value=False)
         self.enable_internal_stats = BooleanVar(value=False)
         self.enable_cross_summary = BooleanVar(value=False)
         self.manual_mode = BooleanVar(value=False)
         self.enable_desensitize = BooleanVar(value=False)
+        self.per_file_salt = BooleanVar(value=False)
+        self.randomize_mode = BooleanVar(value=False)
+        self.fpe_rounds = tk.IntVar(value=DESENS_ROUNDS_DEFAULT)
+        self.mask_header = BooleanVar(value=False)
         self.user_amount_titles = tk.StringVar()
         self.user_counterparty_titles = tk.StringVar()
         self.user_counterparty_id_titles = tk.StringVar()
@@ -2319,14 +3354,18 @@ class App:
         info_text.insert(tk.END, "银行拉取的流水文件中，金额单元格常包含不可见格式（如货币符号、千分位、空格等），"
                                  "导致Excel公式无法正常求和。本软件可自动识别金额列，清理不可见字符，并转换为数值，"
                                  "确保统计准确。同时可生成对手方流水统计表（含流入/流出/合计）以及按对手方账户ID的细分统计。\n\n"
-                                 "【信息脱敏】\n可对指定列进行确定性脱敏（数字→数字、中文→中文、英文→英文，长度不变），"
-                                 "并保存映射文件，方便后续还原。\n\n"
-                                 "【还原脱敏】\n点击下方按钮，分两步操作：先选择脱敏后的文件，再选择对应的映射文件，恢复原始数据。\n\n"
-                                 "【导出运行日志】\n当遇到异常时，可点击“导出运行日志”按钮，将详细运行信息导出供分析。\n\n"
-                                 "【处理完成提示】\n如果某个工作表没有生成统计汇总表（例如对手方名称列整列为空、"
-                                 "金额列识别不到），完成提示框里会列出具体原因，可据此勾选“手动指定列”重跑。")
-        info_text.insert(tk.END, "\n\n【自动运行日志】\n本软件一启动，就会在本软件同目录下写一个日志文件（文件名带版本号，如「银行流水梳理工具 V1.7.3 运行日志.txt」）；保留最近 5 次（当前 + _历史1~4），每次启动自动轮转；上次若是闪退，会自动把上次的末尾留在新日志开头，证据不会丢。遇到卡死或闪退，点“日志存到桌面”，把桌面上那个 txt 发回即可。\n")
-        info_text.insert(tk.END, "\n\n【源码备份】\n打包时源码和图标已经一并打进了 exe。点“导出源码备份”，桌面会多出一个文件夹，里面是当前版本的完整源码（.py）和图标（.ico）——换电脑、重装系统都不会再丢。万一界面打不开，还可以在命令行执行：程序.exe --export-source\n")
+                                 "【信息脱敏】\n独立功能，不能和上面的金额梳理类选项同时使用。"
+                                 "可对指定列做确定性加密（数字→数字、中文→中文、英文→英文，长度不变），"
+                                 "密钥由口令派生，凭口令即可还原；金额列也可以一起勾。\n"
+                                 "  同一次处理共用一把盐：同一批文件里，同一个对手方密文相同，可以互相对照、拼表；\n"
+                                 "  换一次处理就换一把盐，跨批次的密文对不上（故意的，防止跨批拼数据）。\n"
+                                 "  需要「一份文件一把盐」的，在勾选表头的那个窗口里勾上对应选项。\n"
+                                 "  想要「同一个值每次密文都不同」（抗频率分析，但放弃分组聚类），\n"
+                                 "  同一个窗口里勾「随机化加密」——密文会多出 2 个字符的前缀，长度 +2。\n"
+                                 "  同一个窗口里还能填「加密轮数」（默认 12），轮数越多越慢越难反推。\n\n"
+                                 "【还原脱敏】\n选脱敏后的文件，输入当时的口令即可还原。不需要附带任何文件——\n"
+                                 "别人拿到加密文件，用同款软件输同一个口令也能解。\n\n"
+                                 "【导出运行日志】\n当遇到异常时，可点击“导出运行日志”按钮，将详细运行信息导出供分析。")
         info_text.tag_config("red_bold", foreground="red", font=("微软雅黑", 9, "bold"))
         info_text.config(state=tk.DISABLED)
         info_text.pack(fill=tk.BOTH, expand=True)
@@ -2335,40 +3374,53 @@ class App:
         options_frame.pack(pady=5)
 
         row = 0
-        cb_money_clean = tk.Checkbutton(options_frame, text="清理不可见字符，使金额列数据可被正常统计", variable=self.enable_money_clean, bg="#f0f0f0", font=("微软雅黑", 10))
-        cb_money_clean.grid(row=row, column=0, sticky="w", padx=10, pady=2)
+        self.cb_money_clean = tk.Checkbutton(options_frame, text="清理不可见字符，使金额列数据可被正常统计",
+                                             variable=self.enable_money_clean, bg="#f0f0f0",
+                                             font=("微软雅黑", 10), command=self._sync_exclusive)
+        self.cb_money_clean.grid(row=row, column=0, sticky="w", padx=10, pady=2)
         row += 1
 
-        cb_sum = tk.Checkbutton(options_frame, text="在每个区块末尾插入绝对值求和行（标黄）", variable=self.enable_sum, bg="#f0f0f0", font=("微软雅黑", 10))
-        cb_sum.grid(row=row, column=0, sticky="w", padx=10, pady=2)
+        self.cb_sum = tk.Checkbutton(options_frame, text="在每个区块末尾插入绝对值求和行（标黄）",
+                                     variable=self.enable_sum, bg="#f0f0f0",
+                                     font=("微软雅黑", 10), command=self._sync_exclusive)
+        self.cb_sum.grid(row=row, column=0, sticky="w", padx=10, pady=2)
         row += 1
 
-        cb_stats = tk.Checkbutton(options_frame, text="在生成表格内添加对手方流水统计表", variable=self.enable_internal_stats, bg="#f0f0f0", font=("微软雅黑", 10))
-        cb_stats.grid(row=row, column=0, sticky="w", padx=10, pady=2)
+        self.cb_stats = tk.Checkbutton(options_frame, text="在生成表格内添加对手方流水统计表",
+                                       variable=self.enable_internal_stats, bg="#f0f0f0",
+                                       font=("微软雅黑", 10), command=self._sync_exclusive)
+        self.cb_stats.grid(row=row, column=0, sticky="w", padx=10, pady=2)
         row += 1
 
-        cb_cross = tk.Checkbutton(options_frame, text="生成对手方流水统计表汇总文件（仅在勾选并选择多个文件时可用）", variable=self.enable_cross_summary, bg="#f0f0f0", font=("微软雅黑", 10))
-        cb_cross.grid(row=row, column=0, sticky="w", padx=10, pady=2)
+        self.cb_cross = tk.Checkbutton(options_frame, text="生成对手方流水统计表汇总文件（仅在勾选并选择多个文件时可用）",
+                                       variable=self.enable_cross_summary, bg="#f0f0f0",
+                                       font=("微软雅黑", 10), command=self._sync_exclusive)
+        self.cb_cross.grid(row=row, column=0, sticky="w", padx=10, pady=2)
         row += 1
 
         row += 1
         self.manual_frame = Frame(options_frame, bg="#f0f0f0")
         self.manual_frame.grid(row=row, column=0, sticky="w", padx=10, pady=10)
-        manual_cb = Checkbutton(self.manual_frame, text="手动勾选（对手方流水自动识别失败时使用）",
-                                variable=self.manual_mode, bg="#f0f0f0", font=("微软雅黑", 10),
-                                command=self.toggle_manual_input)
-        manual_cb.pack(anchor="w")
+        self.cb_manual = Checkbutton(self.manual_frame, text="手动勾选金额/对手方列（自动识别失败时用）",
+                                     variable=self.manual_mode, bg="#f0f0f0",
+                                     font=("微软雅黑", 10), command=self._on_manual_toggle)
+        self.cb_manual.pack(anchor="w")
 
 
         row += 1
         self.desensitize_frame = Frame(options_frame, bg="#f0f0f0")
         self.desensitize_frame.grid(row=row, column=0, sticky="w", padx=10, pady=10)
-        desensitize_cb = Checkbutton(self.desensitize_frame, text="启用信息脱敏", variable=self.enable_desensitize, bg="#f0f0f0", font=("微软雅黑", 10), command=self.toggle_desensitize_input)
-        desensitize_cb.pack(anchor="w")
+        self.cb_desensitize = Checkbutton(
+            self.desensitize_frame,
+            text="启用信息脱敏（独立功能，不能和金额梳理类选项同时使用）",
+            variable=self.enable_desensitize, bg="#f0f0f0",
+            font=("微软雅黑", 10), command=self._on_desensitize_toggle)
+        self.cb_desensitize.pack(anchor="w")
 
         self.desensitize_pick = Label(self.desensitize_frame, text="", bg="#f0f0f0", font=("微软雅黑", 9),
                                       fg="#006400", wraplength=620, justify="left")
         self.desensitize_pick.pack_forget()
+        self._sync_exclusive()
 
 
         btn_frame = tk.Frame(root, bg="#f0f0f0")
@@ -2376,10 +3428,10 @@ class App:
         self.btn = tk.Button(btn_frame, text="选择文件（可多选）", command=self.select_files, font=("微软雅黑", 10))
         self.btn.pack()
 
-        restore_btn = Button(btn_frame, text="还原脱敏（分两步：先选文件，再选映射文件）", command=restore_file, font=("微软雅黑", 10), bg="#e0e0e0")
+        restore_btn = Button(btn_frame, text="还原脱敏（选文件 → 输口令）", command=restore_file, font=("微软雅黑", 10), bg="#e0e0e0")
         restore_btn.pack(pady=5)
 
-        restore_hint = tk.Label(btn_frame, text="还原操作：依次选择脱敏后的Excel/CSV文件，然后选择对应的脱敏映射文件（.json）",
+        restore_hint = tk.Label(btn_frame, text="还原操作：选脱敏后的文件 → 输入当时的口令。不再需要金库/映射文件，换电脑、发给别人都一样",
                                 bg="#f0f0f0", font=("微软雅黑", 8), fg="gray")
         restore_hint.pack(pady=2)
 
@@ -2529,6 +3581,49 @@ class App:
             raw = ""
         return [p.strip() for p in re.split(r"[，,、]+", raw or "") if p.strip()]
 
+    def _on_manual_toggle(self):
+        try:
+            self.toggle_manual_input()
+        except Exception:
+            pass
+        self._sync_exclusive()
+
+    def _on_desensitize_toggle(self):
+        try:
+            self.toggle_desensitize_input()
+        except Exception:
+            pass
+        self._sync_exclusive()
+
+    def _sync_exclusive(self, *_a):
+        """脱敏 <-> 金额梳理 互斥。
+
+        脱敏是独立功能：它只改标识类列、不碰金额，也产出不了求和行和统计表；
+        金额梳理要读金额、算求和、出统计表。两者同时开，统计出来的就是一堆
+        没有意义的数。所以一边开启，另一边整组置灰。
+        """
+        try:
+            des = bool(self.enable_desensitize.get())
+            money_vars = (self.enable_money_clean, self.enable_sum,
+                          self.enable_internal_stats, self.enable_cross_summary,
+                          self.manual_mode)
+            money_cbs = (self.cb_money_clean, self.cb_sum, self.cb_stats,
+                         self.cb_cross, self.cb_manual)
+            if des:
+                for v in money_vars:
+                    if v.get():
+                        v.set(False)
+                for cb in money_cbs:
+                    cb.config(state=tk.DISABLED)
+                self.cb_desensitize.config(state=tk.NORMAL)
+                return
+            money_on = any(v.get() for v in money_vars)
+            for cb in money_cbs:
+                cb.config(state=tk.NORMAL)
+            self.cb_desensitize.config(state=(tk.DISABLED if money_on else tk.NORMAL))
+        except Exception:
+            pass
+
     def _pick_columns(self, path, need, cur, title_prefix="", header_rows=None, sheets=None):
         """选列窗口：可切工作表、可改表头行；每行三到四列勾选框。
 
@@ -2605,7 +3700,23 @@ class App:
             sheet = sheet_var.get()
             row = max(1, int(row_var.get() or 1))
             hdr_state[sheet] = row
-            titles = self._read_row_titles(path, sheet, row)
+            titles_raw = self._read_row_titles(path, sheet, row)
+            # V1.8.6：同名表头合并成一行显示。
+            # 原来 st 用标题当 key，表里有两列都叫「网联/银联」时，
+            # 第二次 st[t] = per 会把第一次的覆盖掉，第一个勾选框就成了孤儿 ——
+            # 全选怎么点它都不亮（«第三方账户名称» 同理）。
+            # 脱敏本来就是按标题匹配整列的，合并成一行正好对上这个语义。
+            _colmap = {}
+            titles = []
+            for _idx, _t in titles_raw:
+                if _t:
+                    if _t in _colmap:
+                        _colmap[_t].append(_idx)
+                    else:
+                        _colmap[_t] = [_idx]
+                        titles.append((_idx, _t))
+                else:
+                    titles.append((_idx, _t))
             prev = sel_state.setdefault(sheet, {})
             tk.Label(inner, text="表头", bg="white", font=("微软雅黑", 9, "bold")).grid(row=0, column=0, sticky="w", padx=6, pady=2)
             for i, (key, label) in enumerate(cols, start=1):
@@ -2613,7 +3724,12 @@ class App:
             st = {}
             r = 1
             for idx, t in titles:
-                label = t if t else "（第 %d 列，无标题）" % idx
+                if t:
+                    _at = _colmap.get(t) or [idx]
+                    label = t if len(_at) <= 1 else "%s（第 %s 列同名）" % (
+                        t, "、".join(str(x) for x in _at))
+                else:
+                    label = "（第 %d 列，无标题）" % idx
                 tk.Label(inner, text=label, bg="white", font=("微软雅黑", 9), anchor="w",
                          justify="left").grid(row=r, column=0, sticky="w", padx=6)
                 per = {}
@@ -2644,8 +3760,12 @@ class App:
                 st[title] = per
                 r += 1
             current["state"] = st
-            filled = sum(1 for _i, t in titles if t)
-            hint.config(text="本表共 %d 行表头列（有文字的 %d 个）。如果上面的不是真正的表头，改「表头在第几行」再点重新读取。" % (len(titles), filled))
+            filled = sum(1 for _i, t in titles_raw if t)
+            _dup = len(titles_raw) - len(titles)
+            _tail = ("，其中 %d 个同名表头已合并成一行" % _dup) if _dup else ""
+            hint.config(text="本表共 %d 个表头列（有文字的 %d 个%s）。"
+                             "如果上面的不是真正的表头，改「表头在第几行」再点重新读取。"
+                        % (len(titles_raw), filled, _tail))
 
         def _save_current():
             sheet = current.get("sheet")
@@ -2696,6 +3816,20 @@ class App:
         sheet_box.bind("<<ComboboxSelected>>", on_sheet_change)
         row_spin.bind("<Return>", lambda e: refresh())
 
+        def _bulk(mode):
+            """一键全选 / 全不选 / 反选「脱敏」列（只作用于当前工作表）。"""
+            st = current.get("state") or {}
+            for _t, per in st.items():
+                var = per.get("des")
+                if var is None:
+                    continue
+                if mode == "all":
+                    var.set(True)
+                elif mode == "none":
+                    var.set(False)
+                else:
+                    var.set(not var.get())
+
         result = {"ok": False}
 
         def _ok():
@@ -2707,6 +3841,41 @@ class App:
                 pass
             result["ok"] = True
             win.destroy()
+
+        bulk_bar = tk.Frame(win)
+        bulk_bar.pack(pady=(4, 0))
+        tk.Label(bulk_bar, text="脱敏列：", font=("微软雅黑", 9)).pack(side="left")
+        tk.Button(bulk_bar, text="全选", width=6, font=("微软雅黑", 9),
+                  command=lambda: _bulk("all")).pack(side="left", padx=3)
+        tk.Button(bulk_bar, text="全不选", width=6, font=("微软雅黑", 9),
+                  command=lambda: _bulk("none")).pack(side="left", padx=3)
+        tk.Button(bulk_bar, text="反选", width=6, font=("微软雅黑", 9),
+                  command=lambda: _bulk("inv")).pack(side="left", padx=3)
+        tk.Label(bulk_bar, text="（先全选，再把不要的几列点掉；金额列也可以勾）", font=("微软雅黑", 8),
+                 fg="#888888").pack(side="left", padx=6)
+
+        salt_bar = tk.Frame(win)
+        salt_bar.pack(pady=(2, 0))
+        Checkbutton(salt_bar, text="一份文件一把盐（多文件时各自独立、跨文件对不上；不勾＝同批共用一把盐，可互相对照）",
+                    variable=self.per_file_salt, font=("微软雅黑", 9)).pack(side="left")
+
+        rnd_bar = tk.Frame(win)
+        rnd_bar.pack(pady=(1, 0))
+        Checkbutton(rnd_bar, text="随机化加密（同一个值每次密文都不同，抗频率分析；代价：同一对手方不再聚成一组）",
+                    variable=self.randomize_mode, font=("微软雅黑", 9)).pack(side="left")
+
+        hdr_bar = tk.Frame(win)
+        hdr_bar.pack(pady=(1, 0))
+        Checkbutton(hdr_bar, text="表头标题行也加密（勾上后整张表连列名一起变密文；还原时会一起解回来）",
+                    variable=self.mask_header, font=("微软雅黑", 9)).pack(side="left")
+
+        rnd_row = tk.Frame(win)
+        rnd_row.pack(pady=(1, 0))
+        tk.Label(rnd_row, text="加密轮数", font=("微软雅黑", 9)).pack(side="left")
+        tk.Spinbox(rnd_row, from_=1, to=999, width=6, textvariable=self.fpe_rounds,
+                   font=("微软雅黑", 9)).pack(side="left", padx=4)
+        tk.Label(rnd_row, text="轮（默认 12；爱填几轮填几轮，越高越慢越难反推，一般 12~40 够用）",
+                 font=("微软雅黑", 8), fg="#888888").pack(side="left")
 
         btns = tk.Frame(win)
         btns.pack(pady=8)
@@ -2824,6 +3993,21 @@ class App:
 
 
     def start_processing(self, file_paths, overrides=None):
+        try:
+            set_desens_per_file_salt(self.per_file_salt.get())
+            set_desens_randomize(self.randomize_mode.get())
+            set_desens_rounds(self.fpe_rounds.get())
+            set_desens_include_header(self.mask_header.get())
+        except Exception:
+            pass
+        if self.enable_desensitize.get() and not DESENS_PASSWORD:
+            _got = _ask_password("set")
+            if not _got:
+                messagebox.showinfo("已取消", "脱敏需要口令，本次不处理。")
+                return
+            set_desens_password(_got["password"])
+            set_desens_hint(_got.get("hint", ""))
+            log("本次脱敏口令已设置（不落盘、不写日志）")
         self.processing = True
         self.btn.config(state=tk.DISABLED)
         self.progress_win = tk.Toplevel(self.root)
@@ -2943,6 +4127,14 @@ if __name__ == "__main__":
     # 不弹界面、直接写文件退出，界面起不来时也能把源码取回来
     try:
         if _cli_export_source():
+            # V1.8.1：这条路径以前 sys.exit(0) 不写哨兵，导致每次"命令行导源码"
+            # 都被下一次启动判成"上次异常退出"，白搬一遍历史
+            try:
+                logger.info(_EXIT_SENTINEL)
+                logger.info("程序正常退出 %s（命令行导出源码）", VERSION)
+                _flush_all()
+            except Exception:
+                pass
             sys.exit(0)
     except Exception:
         logger.exception("命令行处理失败")
