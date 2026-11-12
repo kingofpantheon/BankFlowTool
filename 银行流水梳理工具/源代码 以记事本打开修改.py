@@ -2460,6 +2460,14 @@ class App:
                 titles.append(t)
         return titles
 
+    def _split_var(self, var):
+        """把「a，b、c」这种多值输入拆成列表。"""
+        try:
+            raw = var.get() if hasattr(var, "get") else str(var or "")
+        except Exception:
+            raw = ""
+        return [p.strip() for p in re.split(r"[，,、]+", raw or "") if p.strip()]
+
     def _pick_columns(self, path, need, cur, title_prefix="", header_rows=None, sheets=None):
         """选列窗口：可切工作表、可改表头行；每行三到四列勾选框。
 
