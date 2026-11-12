@@ -125,14 +125,12 @@
   ├── 源代码 以记事本打开修改.py      # 主程序（单文件，stdlib + pandas/openpyxl/xlrd）
   ├── 打包成EXE就双击我.bat           # 一键打包（自动装 Python 与依赖）
   ├── 软件图标 请确保根目录只有一个.ico文件.ico
-  ├── V1.7.3 更新说明.txt
   └── V1.9.9 更新说明.txt
 tools/
-  ├── selfcheck.py                    # 静态自检
-  └── gui_smoke_picker.py             # 选列窗口冒烟
+  └── selfcheck.py                    # 打包前静态自检（漏定义方法 / tkinter 名字裸用）
 screenshots/
 README.md
-RELEASE-v1.7.0.md ~ RELEASE-v1.9.9.md
+RELEASE-v1.9.9.md
 ```
 
 ## 📄 许可证
