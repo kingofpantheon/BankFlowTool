@@ -45,7 +45,7 @@ import faulthandler
 import threading
 import traceback
 
-VERSION = "V2.0.7"
+VERSION = "V2.0.8"
 APP_NAME = "银行流水梳理工具"
 
 # 卡死判定：主线程超过这么多秒没有心跳，就把所有线程堆栈写进日志
@@ -1044,6 +1044,7 @@ def export_log():
 import hmac
 import secrets
 import base64
+import unicodedata
 
 _ALPHA = {
     "digit": list(string.digits),
@@ -1650,6 +1651,63 @@ def clean_money_cell(cell_value):
     val = parse_amount(cell_value)
     return val if val is not None else cell_value
 
+def _xls_to_workbook(path):
+    """用 xlrd 把 .xls 读成 openpyxl 工作簿（保留工作表名和单元格类型）。
+
+    xlrd 的 ctype：0 空 / 1 文本 / 2 数字 / 3 日期 / 4 布尔 / 5 错误 / 6 空白
+    """
+    import xlrd
+    src = xlrd.open_workbook(path, on_demand=True)
+    wb = Workbook()
+    try:
+        wb.remove(wb.active)
+    except Exception:
+        pass
+    for sname in src.sheet_names():
+        sh = src.sheet_by_name(sname)
+        ws = wb.create_sheet(title=(str(sname) or "Sheet")[:31])
+        for r in range(sh.nrows):
+            for c in range(sh.ncols):
+                cell = sh.cell(r, c)
+                v = cell.value
+                if cell.ctype == 0 or cell.ctype == 6:          # empty / blank
+                    continue
+                if cell.ctype == 3:                              # date
+                    try:
+                        v = xlrd.xldate.xldate_as_datetime(v, src.datemode)
+                    except Exception:
+                        pass
+                elif cell.ctype == 4:                            # bool
+                    v = bool(v)
+                elif cell.ctype == 5:                            # error
+                    continue
+                elif cell.ctype == 2:                            # number
+                    try:
+                        if float(v).is_integer():
+                            v = int(v)
+                    except Exception:
+                        pass
+                ws.cell(row=r + 1, column=c + 1).value = v
+    try:
+        src.release_resources()
+    except Exception:
+        pass
+    return wb
+
+
+def _norm_title(s):
+    """表头归一化：全角转半角、去所有空白、转小写。
+
+    「交易金额（分）」和「交易金额(分)」，「 用户 ID 」和「用户ID」
+    归一化之后都能对上。
+    """
+    try:
+        s = unicodedata.normalize("NFKC", str(s or ""))
+    except Exception:
+        s = str(s or "")
+    return re.sub(r"\s+", "", s).strip().lower()
+
+
 def cell_text(value):
     """把单元格值转成干净的文本（整数型浮点不带 .0），用于对手方名称/ID。"""
     if value is None:
@@ -2044,10 +2102,11 @@ def find_column_by_title(ws, max_col, header_row, title_list, start_row=None, en
     matches = []
     seen = set()
     for user_title in title_list:
+        _ut = _norm_title(user_title)
         for col, name in col_names.items():
             if col in seen:
                 continue
-            if name == user_title or user_title in name:
+            if _norm_title(name) == _ut or _ut in _norm_title(name):
                 seen.add(col)
                 matches.append((col, name == user_title))
     if not matches:
@@ -2405,7 +2464,7 @@ def _pick_header_by_titles(ws, start, end, max_col, wanted):
         hit = 0
         for col in range(1, max_col + 1):
             title = cell_text(ws.cell(row=row, column=col).value).strip()
-            if title and title in wanted:
+            if title and _norm_title(title) in wanted:
                 hit += 1
         if hit > best_hit:
             best_row, best_hit = row, hit
@@ -2419,7 +2478,7 @@ def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
     """
     total = 0
     _hit_cols = set()
-    wanted = set(t.strip() for t in (wanted_titles or []) if t and t.strip())
+    wanted = set(_norm_title(t) for t in (wanted_titles or []) if t and t.strip())
     if not wanted:
         return total, _hit_cols
     segs = _sheet_segments(ws, ws.max_column)
@@ -2431,7 +2490,7 @@ def _mask_sheet_columns(ws, wanted_titles, fallback_header=None):
             hdr = s
         for col in range(1, ws.max_column + 1):
             title = cell_text(ws.cell(row=hdr, column=col).value).strip()
-            if not title or title not in wanted:
+            if not title or _norm_title(title) not in wanted:
                 continue
             _start = hdr if DESENS_INCLUDE_HEADER else hdr + 1
             for r in range(_start, e + 1):
@@ -3707,9 +3766,17 @@ class App:
         pass
 
     def _open_wb(self, file_path):
+        """统一入口：.csv / .xls / .xlsx 都能打开。
+
+        V2.0.8：以前这里只有 openpyxl，碰到 .xls 就抛
+        "openpyxl does not support the old .xls file format"，
+        导致选列窗口读不到表头、整个脱敏没法用。
+        """
         ext = str(file_path).lower()
         if ext.endswith('.csv'):
             return grid_to_workbook(read_csv_grid(file_path))
+        if ext.endswith('.xls'):
+            return _xls_to_workbook(file_path)
         return load_workbook(file_path, data_only=True)
 
     def _sheet_names(self, file_path):
